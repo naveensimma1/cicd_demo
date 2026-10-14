@@ -1,0 +1,12 @@
+{
+  "name": "concierto-cicd",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Concierto CI/CD prototype for Jenkins, GitHub Actions, and Azure DevOps",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
