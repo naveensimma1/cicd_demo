@@ -675,7 +675,8 @@ async function publishJenkins(cfg, pipeline, overwrite) {
     fail(400, 'Jenkins job name can use letters, numbers, spaces, dots, underscores, and hyphens. Create folders in Jenkins itself.');
   }
   const script = String(pipeline.definitionText || '').trim() || jenkinsScript(pipeline, cfg.shell);
-  const xml = jenkinsXml(script, 'Managed by Concierto CICD');
+  let xml = jenkinsXml(script, 'Managed by Concierto CICD');
+  if (Array.isArray(pipeline.parameterDefs) && pipeline.parameterDefs.length) xml = upsertParameterProperty(xml, pipeline.parameterDefs);
   const exists = await jenkinsJobExists(cfg, jobName);
   if (exists && !overwrite) {
     fail(409, 'Jenkins already has a job named "' + jobName + '". Link that job, or choose another name.');
@@ -1133,11 +1134,21 @@ async function refreshRun(creds, pipeline, run, withLog) {
   return { status: run.status };
 }
 
+function decodeXml(text) {
+  return String(text || '')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, '&');
+}
+
 async function fetchDefinition(creds, pipeline) {
   if (pipeline.engine === 'Jenkins' && pipeline.externalId) {
     const { text } = await jenkinsSend(creds.jenkins, 'GET', jobApiPath(pipeline.externalId) + '/config.xml');
     const match = text.match(/<script>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/script>/);
-    return { text: match ? match[1].trim() : text, source: 'Jenkins job ' + pipeline.externalId };
+    const script = decodeXml(match ? match[1].trim() : text);
+    return { text: script, source: 'Jenkins job ' + pipeline.externalId };
   }
   if (pipeline.engine === 'GitHub Actions' && pipeline.repo && pipeline.workflow) {
     const file = await githubFile(creds.github, pipeline.repo, pipeline.workflow, pipeline.branch || creds.github.branch || 'main');
@@ -1310,13 +1321,14 @@ async function renameJenkins(cfg, fromName, toName) {
   await jenkinsSend(cfg, 'POST', jobApiPath(fromName) + '/doRename?newName=' + encodeURIComponent(toName));
 }
 
-async function saveJenkinsScript(cfg, jobName, script) {
+async function saveJenkinsScript(cfg, jobName, script, parameterDefs) {
   const { text } = await jenkinsSend(cfg, 'GET', jobApiPath(jobName) + '/config.xml');
   if (!/<script[\s>]/.test(text)) {
     fail(400, 'This Jenkins job is not a Pipeline job, so its script cannot be edited from Concierto.');
   }
   const safe = String(script || '').replace(/]]>/g, ']]]]><![CDATA[>');
-  const xml = text.replace(/<script>[\s\S]*?<\/script>/, '<script><![CDATA[' + safe + ']]></script>');
+  let xml = text.replace(/<script>[\s\S]*?<\/script>/, '<script><![CDATA[' + safe + ']]></script>');
+  if (Array.isArray(parameterDefs)) xml = upsertParameterProperty(xml, parameterDefs);
   await jenkinsSend(cfg, 'POST', jobApiPath(jobName) + '/config.xml', { body: xml, contentType: 'application/xml; charset=utf-8' });
   const base = cfg.url.replace(/\/+$/, '');
   return { externalId: jobName, workflow: jobName, webUrl: base + '/' + jobApiPath(jobName) + '/' };
@@ -1382,7 +1394,9 @@ async function writeAzureFile(cfg, repositoryName, yamlPath, branch, text) {
 async function saveDefinition(creds, pipeline, text, filePath) {
   if (pipeline.engine === 'Jenkins') {
     const jobName = pipeline.externalId || pipeline.jenkinsJob || pipeline.name;
-    return saveJenkinsScript(creds.jenkins, jobName, text);
+    let script = text;
+    if (Array.isArray(pipeline.parameterDefs)) script = writeJenkinsParameterBlock(script, pipeline.parameterDefs);
+    return saveJenkinsScript(creds.jenkins, jobName, script, pipeline.parameterDefs);
   }
   if (pipeline.engine === 'GitHub Actions') {
     const repo = pipeline.repo || pipeline.githubRepo;
@@ -1557,14 +1571,14 @@ function filterNamedSteps(text, keep, nameKey, stub) {
 }
 
 function listUnits(text, engine) {
-  if (engine === 'Jenkins') return jenkinsStageSpans(text).map((span) => span.name);
+  if (engine === 'Jenkins') return jenkinsStageSpans(decodeXml(text)).map((span) => span.name);
   const key = engine === 'Azure DevOps' ? 'displayName' : 'name';
   return stepBlocks(String(text || '').split(/\r?\n/), key).map((block) => block.name).filter(Boolean);
 }
 
 function keepSelected(text, engine, stages) {
   const keep = (stages || []).map((item) => String(item || '').trim()).filter(Boolean);
-  const source = String(text || '');
+  const source = engine === 'Jenkins' ? decodeXml(text) : String(text || '');
   if (!keep.length || !source.trim()) return { text: source, names: listUnits(source, engine) };
   if (engine === 'Jenkins') return filterJenkinsStages(source, keep);
   if (engine === 'Azure DevOps') {
@@ -1710,6 +1724,212 @@ async function abortBuild(creds, pipeline, buildId) {
   fail(400, 'This engine cannot be stopped from the prototype.');
 }
 
+function xmlEscape(value) {
+  return String(value ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function parametersBlockSpan(text) {
+  const match = String(text || '').match(/parameters\s*\{/);
+  if (!match) return null;
+  const brace = text.indexOf('{', match.index);
+  let depth = 0;
+  let end = brace;
+  for (; end < text.length; end++) {
+    if (text[end] === '{') depth += 1;
+    else if (text[end] === '}') {
+      depth -= 1;
+      if (depth === 0) { end += 1; break; }
+    }
+  }
+  return { start: match.index, end, body: text.slice(brace + 1, end - 1) };
+}
+
+function argValue(args, key) {
+  const re = new RegExp(key + "\\s*:\\s*(?:'([^']*)'|\"([^\"]*)\"|(true|false)|([^,\\n]+))", 'i');
+  const match = String(args || '').match(re);
+  if (!match) return '';
+  return String(match[1] ?? match[2] ?? match[3] ?? match[4] ?? '').trim();
+}
+
+function argList(args, key) {
+  const match = String(args || '').match(new RegExp(key + '\\s*:\\s*\\[([^\\]]*)\\]', 'i'));
+  if (!match) return '';
+  return match[1].split(',').map((item) => item.trim().replace(/^['"]|['"]$/g, '')).filter(Boolean).join('\n');
+}
+
+function parseJenkinsParameters(text) {
+  const decoded = decodeXml(text);
+  const span = parametersBlockSpan(decoded);
+  if (!span) return [];
+  const params = [];
+  const re = /(string|text|booleanParam|choice)\s*\(/g;
+  let match;
+  while ((match = re.exec(span.body))) {
+    let depth = 1;
+    let index = match.index + match[0].length;
+    for (; index < span.body.length && depth; index++) {
+      if (span.body[index] === '(') depth += 1;
+      else if (span.body[index] === ')') depth -= 1;
+    }
+    const args = span.body.slice(match.index + match[0].length, index - 1);
+    const name = argValue(args, 'name');
+    if (!name) continue;
+    const type = match[1] === 'booleanParam' ? 'boolean' : match[1] === 'choice' ? 'choice' : match[1] === 'text' ? 'text' : 'string';
+    params.push({
+      name,
+      type,
+      defaultValue: type === 'choice' ? '' : argValue(args, 'defaultValue'),
+      description: argValue(args, 'description'),
+      choices: type === 'choice' ? argList(args, 'choices') : ''
+    });
+    re.lastIndex = index;
+  }
+  return params;
+}
+
+function writeJenkinsParameterBlock(script, params) {
+  const decoded = decodeXml(script);
+  const lines = (params || []).filter((item) => item && String(item.name || '').trim()).map((item) => {
+    const name = String(item.name).replace(/'/g, "\\'");
+    const description = String(item.description || '').replace(/'/g, "\\'");
+    const fallback = String(item.defaultValue ?? '').replace(/'/g, "\\'");
+    if (item.type === 'boolean') {
+      const on = item.defaultValue === true || String(item.defaultValue) === 'true';
+      return "    booleanParam(name: '" + name + "', defaultValue: " + on + ", description: '" + description + "')";
+    }
+    if (item.type === 'choice') {
+      const choices = String(item.choices || item.defaultValue || '').split(/\n|,/).map((part) => part.trim()).filter(Boolean);
+      const list = choices.map((choice) => "'" + choice.replace(/'/g, "\\'") + "'").join(', ');
+      return "    choice(name: '" + name + "', choices: [" + list + "], description: '" + description + "')";
+    }
+    const call = item.type === 'text' ? 'text' : 'string';
+    return "    " + call + "(name: '" + name + "', defaultValue: '" + fallback + "', description: '" + description + "')";
+  });
+  const block = lines.length ? 'parameters {\n' + lines.join('\n') + '\n  }' : '';
+  const span = parametersBlockSpan(decoded);
+  if (span) {
+    const next = decoded.slice(0, span.start) + block + decoded.slice(span.end);
+    return next.replace(/\n{3,}/g, '\n\n');
+  }
+  if (!block) return decoded;
+  const agent = decoded.match(/agent\s+[^\n{]+\{|agent\s+\w+/);
+  if (agent) {
+    const at = agent.index + agent[0].length;
+    return decoded.slice(0, at) + '\n  ' + block + decoded.slice(at);
+  }
+  const open = decoded.indexOf('{');
+  if (open >= 0) return decoded.slice(0, open + 1) + '\n  ' + block + decoded.slice(open + 1);
+  return block + '\n' + decoded;
+}
+
+function jenkinsParameterProperty(params) {
+  const items = (params || []).filter((item) => item && item.name).map((item) => {
+    const name = xmlEscape(item.name);
+    const description = xmlEscape(item.description || '');
+    if (item.type === 'boolean') {
+      const on = item.defaultValue === true || String(item.defaultValue) === 'true';
+      return '<hudson.model.BooleanParameterDefinition><name>' + name + '</name><description>' + description + '</description><defaultValue>' + on + '</defaultValue></hudson.model.BooleanParameterDefinition>';
+    }
+    if (item.type === 'text') {
+      return '<hudson.model.TextParameterDefinition><name>' + name + '</name><description>' + description + '</description><defaultValue>' + xmlEscape(item.defaultValue || '') + '</defaultValue><trim>false</trim></hudson.model.TextParameterDefinition>';
+    }
+    if (item.type === 'choice') {
+      const choices = String(item.choices || item.defaultValue || '').split(/\n|,/).map((part) => part.trim()).filter(Boolean);
+      const strings = choices.map((choice) => '<string>' + xmlEscape(choice) + '</string>').join('');
+      return '<hudson.model.ChoiceParameterDefinition><name>' + name + '</name><description>' + description + '</description><choices class="java.util.Arrays$ArrayList"><a class="string-array">' + strings + '</a></choices></hudson.model.ChoiceParameterDefinition>';
+    }
+    return '<hudson.model.StringParameterDefinition><name>' + name + '</name><description>' + description + '</description><defaultValue>' + xmlEscape(item.defaultValue || '') + '</defaultValue><trim>false</trim></hudson.model.StringParameterDefinition>';
+  }).join('');
+  if (!items) return '';
+  return '<hudson.model.ParametersDefinitionProperty><parameterDefinitions>' + items + '</parameterDefinitions></hudson.model.ParametersDefinitionProperty>';
+}
+
+function upsertParameterProperty(xml, params) {
+  const block = jenkinsParameterProperty(params);
+  const existing = /<hudson\.model\.ParametersDefinitionProperty>[\s\S]*?<\/hudson\.model\.ParametersDefinitionProperty>/;
+  if (existing.test(xml)) return xml.replace(existing, block);
+  if (!block) return xml;
+  if (/<properties\s*\/>/.test(xml)) return xml.replace(/<properties\s*\/>/, '<properties>' + block + '</properties>');
+  if (/<properties>/.test(xml)) return xml.replace(/<properties>/, '<properties>' + block);
+  return xml;
+}
+
+function ensureImagePublish(text, engine, image, shell) {
+  const name = String(image || '').trim();
+  if (!name) return text;
+  const source = String(text || '');
+  if (source.includes('docker push') && source.includes(name)) return source;
+  if (engine === 'Jenkins') {
+    const command = shell === 'sh'
+      ? "sh '''\ndocker build -t " + name + ":${BUILD_NUMBER} .\ndocker push " + name + ":${BUILD_NUMBER}\n'''"
+      : "bat '''\ndocker build -t " + name + ":%BUILD_NUMBER% .\ndocker push " + name + ":%BUILD_NUMBER%\n'''";
+    const stage = "\n    stage('Push image') {\n      steps {\n        " + command + "\n      }\n    }\n";
+    const close = source.lastIndexOf('}');
+    return close >= 0 ? source.slice(0, close) + stage + source.slice(close) : source + stage;
+  }
+  if (engine === 'GitHub Actions') {
+    return source.replace(/\s*$/, '') + "\n      - name: Build and push image\n        run: |\n          docker build -t " + name + ":${{ github.run_number }} .\n          docker push " + name + ":${{ github.run_number }}\n";
+  }
+  return source.replace(/\s*$/, '') + "\n- bash: |\n    docker build -t " + name + ":$(Build.BuildId) .\n    docker push " + name + ":$(Build.BuildId)\n  displayName: Build and push image\n";
+}
+
+async function publishedArtifacts(creds, pipeline) {
+  const out = [];
+  try {
+    if (pipeline.engine === 'Jenkins' && pipeline.externalId) {
+      const { data } = await jenkinsSend(creds.jenkins, 'GET', jobApiPath(pipeline.externalId) + '/api/json?tree=' + encodeURIComponent('builds[number,url,artifacts[fileName,relativePath]]{0,15}'));
+      for (const build of asList(data && data.builds)) {
+        for (const art of asList(build.artifacts)) {
+          out.push({
+            key: 'jenkins:' + pipeline.externalId + ':' + build.number + ':' + (art.relativePath || art.fileName),
+            name: art.fileName || art.relativePath,
+            location: (build.url || '') + 'artifact/' + (art.relativePath || ''),
+            build: '#' + build.number,
+            kind: 'File',
+            pipelineName: pipeline.name,
+            engine: 'Jenkins'
+          });
+        }
+      }
+    } else if (pipeline.engine === 'GitHub Actions' && pipeline.repo) {
+      const { owner, name } = splitRepo(pipeline.repo);
+      const { data } = await githubRaw(creds.github.token, 'GET', '/repos/' + encodeURIComponent(owner) + '/' + encodeURIComponent(name) + '/actions/artifacts?per_page=30');
+      for (const art of data.artifacts || []) {
+        if (art.expired) continue;
+        const runId = art.workflow_run && art.workflow_run.id;
+        out.push({
+          key: 'github:' + art.id,
+          name: art.name,
+          location: 'https://github.com/' + normalizeRepo(pipeline.repo) + (runId ? '/actions/runs/' + runId : '/actions'),
+          build: art.workflow_run && art.workflow_run.run_number ? '#' + art.workflow_run.run_number : '',
+          kind: 'File',
+          pipelineName: pipeline.name,
+          engine: 'GitHub Actions'
+        });
+      }
+    } else if (pipeline.engine === 'Azure DevOps' && pipeline.externalId) {
+      const runs = await azureSend(creds.azureDevOps, 'GET', projectPath(creds.azureDevOps, 'pipelines/' + encodeURIComponent(pipeline.externalId) + '/runs?$top=8'));
+      for (const run of (runs.data.value || []).slice(0, 8)) {
+        try {
+          const arts = await azureSend(creds.azureDevOps, 'GET', projectPath(creds.azureDevOps, 'build/builds/' + encodeURIComponent(run.id) + '/artifacts'));
+          for (const art of arts.data.value || []) {
+            out.push({
+              key: 'azure:' + pipeline.externalId + ':' + run.id + ':' + art.name,
+              name: art.name,
+              location: (art.resource && art.resource.downloadUrl) || (run._links && run._links.web && run._links.web.href) || '',
+              build: '#' + run.id,
+              kind: 'File',
+              pipelineName: pipeline.name,
+              engine: 'Azure DevOps'
+            });
+          }
+        } catch { /* this run has no artifact list */ }
+      }
+    }
+  } catch { /* one pipeline should not block the rest */ }
+  return out;
+}
+
 module.exports = {
   DEFAULT_STAGES,
   cleanStages,
@@ -1744,5 +1964,10 @@ module.exports = {
   listBuilds,
   buildLog,
   abortBuild,
+  decodeXml,
+  parseJenkinsParameters,
+  writeJenkinsParameterBlock,
+  ensureImagePublish,
+  publishedArtifacts,
   isPagesWorkflow: (name, path) => /pages-build-deployment/i.test(String(name || '') + ' ' + String(path || ''))
 };

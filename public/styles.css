@@ -206,7 +206,9 @@ input:focus, select:focus, textarea:focus { outline: 2px solid #f7c49a; border-c
 .check { display: flex; gap: 8px; align-items: flex-start; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; margin-bottom: 8px; background: #fafbfd; }
 .check input { width: auto; margin-top: 2px; }
 .check-list { max-height: 360px; overflow: auto; }
-.stage-row { display: flex; gap: 6px; margin-bottom: 6px; }
+.param-row, .stage-row { display: flex; gap: 6px; margin-bottom: 6px; }
+.param-row input, .param-row select { min-width: 0; }
+.param-row button { border: 1px solid var(--line); background: #fff; border-radius: 8px; width: 32px; }
 .stage-row input { flex: 1; }
 #p-def { min-height: 420px; font-family: Consolas, "Cascadia Mono", monospace; font-size: 12px; }
 .file-tree { border: 1px solid var(--line); border-radius: 8px; padding: 8px; margin-bottom: 8px; max-height: 180px; overflow: auto; background: #fafbfd; }

@@ -250,6 +250,12 @@ function showView(view) {
     return;
   }
   render();
+  if (entered && next === 'artifacts') {
+    api('/api/artifacts/collect', { method: 'POST', body: {} }).then(() => api('/api/state')).then((data) => {
+      S = data;
+      if (currentView === 'artifacts') render();
+    }).catch(() => {});
+  }
   if (entered && next.startsWith('pipeline/')) decoratePipeline(next.slice(9));
 }
 function render(opts) {
@@ -321,10 +327,10 @@ function applications() {
   const data = pageOf(S.apps || [], (app) => [app.name, app.repo, app.source, app.branch].join(' '));
   const rows = data.rows.map((app) => {
     const count = (S.pipelines || []).filter((pipe) => pipe.appId === app.id).length;
-    return '<tr><td><b>' + esc(app.name) + '</b></td><td>' + esc(app.source || '—') + '</td><td>' + esc(app.repo || '—') + '</td><td>' + esc(app.branch || '—') + '</td><td>' + count + '</td><td class="actions-cell"><button type="button" class="btn btn-ghost small" data-act="edit-app" data-id="' + esc(app.id) + '">Edit</button><button type="button" class="btn btn-danger small" data-act="delete-app" data-id="' + esc(app.id) + '">Delete</button></td></tr>';
+    return '<tr><td><b>' + esc(app.name) + '</b></td><td>' + esc(app.source || '—') + '</td><td>' + esc(app.repo || '—') + '</td><td>' + esc(app.image || '—') + '</td><td>' + count + '</td><td class="actions-cell"><button type="button" class="btn btn-ghost small" data-act="edit-app" data-id="' + esc(app.id) + '">Edit</button><button type="button" class="btn btn-danger small" data-act="delete-app" data-id="' + esc(app.id) + '">Delete</button></td></tr>';
   }).join('');
-  return toolbarHtml('Register the application, then attach or create its pipeline.', '<button type="button" class="btn btn-primary" data-act="add-app">Add application</button>') +
-    table(['Application', 'Source', 'Repository', 'Branch', 'Pipelines', ''], rows, 6, 'No applications yet.') + pager(data.total);
+  return toolbarHtml('Register the application and, if it ships a container, the image name the pipeline should build and push.', '<button type="button" class="btn btn-primary" data-act="add-app">Add application</button>') +
+    table(['Application', 'Source', 'Repository', 'Image', 'Pipelines', ''], rows, 6, 'No applications yet.') + pager(data.total);
 }
 function pipelines() {
   const data = pageOf(S.pipelines || [], (pipe) => [pipe.name, pipe.engine, pipe.repo, pipe.workflow, pipe.status, pipe.lastRunLabel].join(' '));
@@ -334,21 +340,24 @@ function pipelines() {
 }
 function environments() {
   const data = pageOf(S.environments || [], (env) => [env.name, env.status, env.version, appName(env.appId)].join(' '));
-  const rows = data.rows.map((env) => '<tr><td><b>' + esc(env.name) + '</b></td><td>' + esc(appName(env.appId)) + '</td><td>' + pill(env.status) + '</td><td>' + esc(env.version || '—') + '</td><td class="actions-cell"><button type="button" class="btn btn-ghost small" data-act="edit-env" data-id="' + esc(env.id) + '">Edit</button><button type="button" class="btn btn-danger small" data-act="delete-env" data-id="' + esc(env.id) + '">Delete</button></td></tr>').join('');
-  return toolbarHtml('Promotion targets used by releases and approval gates.', '<button type="button" class="btn btn-primary" data-act="add-env">Add environment</button>') +
-    table(['Environment', 'Application', 'Status', 'Version', ''], rows, 5, 'No environments yet.') + pager(data.total);
+  const rows = data.rows.map((env) => '<tr><td><b>' + esc(env.name) + '</b></td><td>' + esc(appName(env.appId)) + '</td><td>' + esc(env.pipelineName || '—') + '</td><td>' + esc(env.version || '—') + '</td><td>' + pill(env.status) + '</td><td class="actions-cell"><button type="button" class="btn btn-ghost small" data-act="edit-env" data-id="' + esc(env.id) + '">Edit</button><button type="button" class="btn btn-danger small" data-act="delete-env" data-id="' + esc(env.id) + '">Delete</button></td></tr>').join('');
+  return toolbarHtml('A pipeline can deploy into one of these environments. A successful run updates the version here. An approved release does the same.', '<button type="button" class="btn btn-primary" data-act="add-env">Add environment</button>') +
+    table(['Environment', 'Application', 'Last pipeline', 'Version', 'Status', ''], rows, 6, 'No environments yet.') + pager(data.total);
 }
 function releases() {
   const data = pageOf(S.releases || [], (rel) => [rel.name, rel.environment, rel.status, appName(rel.appId)].join(' '));
-  const rows = data.rows.map((rel) => '<tr><td><b>' + esc(rel.name) + '</b></td><td>' + esc(appName(rel.appId)) + '</td><td>' + esc(rel.environment) + '</td><td>' + pill(rel.status) + '</td><td>' + formatTime(rel.created) + '</td><td class="actions-cell">' + (rel.status === 'Approved' ? '' : '<button type="button" class="btn btn-primary small" data-act="approve-rel" data-id="' + esc(rel.id) + '">Approve</button> ') + '<button type="button" class="btn btn-ghost small" data-act="edit-rel" data-id="' + esc(rel.id) + '">Edit</button><button type="button" class="btn btn-danger small" data-act="delete-rel" data-id="' + esc(rel.id) + '">Delete</button></td></tr>').join('');
-  return toolbarHtml('Track a version and approve it before it is treated as released.', '<button type="button" class="btn btn-primary" data-act="add-rel">Create release</button>') +
-    table(['Release', 'Application', 'Target', 'Status', 'Created', ''], rows, 6, 'No releases yet.') + pager(data.total);
+  const rows = data.rows.map((rel) => {
+    const pipe = (S.pipelines || []).find((item) => item.id === rel.pipelineId);
+    return '<tr><td><b>' + esc(rel.name) + '</b></td><td>' + esc(appName(rel.appId)) + '</td><td>' + esc(pipe ? pipe.name : '—') + '</td><td>' + esc(rel.environment) + '</td><td>' + esc(rel.version || '—') + '</td><td>' + pill(rel.status) + '</td><td>' + formatTime(rel.created) + '</td><td class="actions-cell">' + (rel.status === 'Approved' ? '' : '<button type="button" class="btn btn-primary small" data-act="approve-rel" data-id="' + esc(rel.id) + '">Approve</button> ') + '<button type="button" class="btn btn-ghost small" data-act="edit-rel" data-id="' + esc(rel.id) + '">Edit</button><button type="button" class="btn btn-danger small" data-act="delete-rel" data-id="' + esc(rel.id) + '">Delete</button></td></tr>';
+  }).join('');
+  return toolbarHtml('Promote a pipeline version into an environment. Approve writes that version onto the environment.', '<button type="button" class="btn btn-primary" data-act="add-rel">Create release</button>') +
+    table(['Release', 'Application', 'Pipeline', 'Environment', 'Version', 'Status', 'Created', ''], rows, 8, 'No releases yet.') + pager(data.total);
 }
 function artifacts() {
   const data = pageOf(S.artifacts || [], (art) => [art.name, art.registry, appName(art.appId)].join(' '));
-  const rows = data.rows.map((art) => '<tr><td><b>' + esc(art.name) + '</b></td><td>' + esc(appName(art.appId)) + '</td><td>' + esc(art.registry || '—') + '</td><td>' + pill(art.status || 'Available') + '</td><td>' + formatTime(art.created) + '</td><td class="actions-cell"><button type="button" class="btn btn-ghost small" data-act="edit-art" data-id="' + esc(art.id) + '">Edit</button><button type="button" class="btn btn-danger small" data-act="delete-art" data-id="' + esc(art.id) + '">Delete</button></td></tr>').join('');
-  return toolbarHtml('Successful runs add an artifact record. You can also add one by hand.', '<button type="button" class="btn btn-primary" data-act="add-art">Add artifact</button>') +
-    table(['Artifact', 'Application', 'Location', 'Status', 'Created', ''], rows, 6, 'No artifacts yet.') + pager(data.total);
+  const rows = data.rows.map((art) => '<tr><td><b>' + (art.location ? '<a href="' + esc(art.location) + '" target="_blank" rel="noopener">' + esc(art.name) + '</a>' : esc(art.name)) + '</b></td><td>' + esc(art.kind || 'Build') + '</td><td>' + esc(art.pipelineName || '—') + '</td><td>' + esc(art.build || '—') + '</td><td>' + esc(appName(art.appId)) + '</td><td>' + pill(art.status || 'Available') + '</td><td class="actions-cell"><button type="button" class="btn btn-danger small" data-act="delete-art" data-id="' + esc(art.id) + '">Delete</button></td></tr>').join('');
+  return toolbarHtml('Files archived by Jenkins, GitHub Actions, or Azure DevOps, plus container images recorded when a build-and-push pipeline succeeds.', '<button type="button" class="btn btn-primary" data-act="collect-art">Collect from tools</button>') +
+    table(['Artifact', 'Kind', 'Pipeline', 'Build', 'Application', 'Status', ''], rows, 7, 'No artifacts yet. Run a pipeline or collect from the tools.') + pager(data.total);
 }
 function integrations() {
   return bannerHtml() + '<div class="toolbar"><div class="muted">Test the saved credentials, then pull pipelines into Concierto.</div><div class="actions"><button type="button" class="btn btn-primary" data-act="sync" data-provider="all">Sync all</button><button type="button" class="btn" data-view="credentials">Credential Manager</button></div></div><div class="three">' +
@@ -400,10 +409,10 @@ function statusLine(key) {
   return '<p class="hint">' + esc(status.message || '') + ' · ' + formatTime(status.at) + '</p>';
 }
 function audit() {
-  const data = pageOf(S.audit || [], (item) => item.text || '');
-  const rows = data.rows.map((item) => '<tr><td>' + formatTime(item.time) + '</td><td>' + esc(item.text) + '</td></tr>').join('');
-  return toolbarHtml('Create, sync, run, approval, and credential changes on this machine.', '') +
-    table(['Time', 'Activity'], rows, 2, 'No activity yet.') + pager(data.total);
+  const data = pageOf(S.audit || [], (item) => [item.detail, item.text, item.user, item.action, item.host].join(' '));
+  const rows = data.rows.map((item) => '<tr><td>' + formatTime(item.time) + '</td><td>' + esc(item.user || '—') + '</td><td>' + esc(item.host || S.host || '—') + '</td><td>' + pill(item.action || 'Activity') + '</td><td>' + esc(item.detail || item.text || '') + '</td></tr>').join('');
+  return toolbarHtml('Who did what in this CI/CD module on ' + esc(S.host || 'this machine') + '.', '') +
+    table(['Time', 'User', 'Machine', 'Action', 'Detail'], rows, 5, 'No activity yet.') + pager(data.total);
 }
 function moduleView(name) {
   return '<div class="placeholder"><h2>' + esc(name) + '</h2><p class="hint">This menu is part of the Concierto shell. The working module in this prototype is CI/CD.</p><button type="button" class="btn btn-primary" data-nav="cicd">Open CI/CD</button></div>';
@@ -457,7 +466,8 @@ function appForm(app) {
     field('Source', '<select id="a-source">' + optionList(['GitHub', 'Azure Repos', 'Other'], item.source || 'GitHub') + '</select>') +
     field('Repository', '<input id="a-repo" value="' + esc(item.repo || '') + '" placeholder="owner/name">', 'full') +
     field('Branch', '<input id="a-branch" value="' + esc(item.branch || 'main') + '">') +
-    field('Existing image, optional', '<input id="a-image" value="' + esc(item.image || '') + '">') +
+    field('Container image', '<input id="a-image" value="' + esc(item.image || '') + '" placeholder="ghcr.io/owner/app">', 'full') +
+    '<p class="hint full">Optional. A pipeline for this application can build this image and push it. A successful run then shows up under Artifacts.</p>' +
     '</div>';
 }
 function envForm(env) {
@@ -470,11 +480,14 @@ function envForm(env) {
     '</div>';
 }
 function releaseForm(rel) {
-  const item = rel || { name: '', appId: '', environment: 'DEV' };
+  const item = rel || { name: '', appId: '', environment: 'DEV', pipelineId: '', version: '' };
+  const pipes = (S.pipelines || []).map((pipe) => '<option value="' + esc(pipe.id) + '" ' + (pipe.id === item.pipelineId ? 'selected' : '') + '>' + esc(pipe.name) + '</option>').join('');
   return '<div class="form-grid">' +
     field('Release name', '<input id="r-name" value="' + esc(item.name) + '">') +
     field('Application', '<select id="r-app">' + appOptions(item.appId || '') + '</select>') +
+    field('Pipeline', '<select id="r-pipe"><option value="">Choose</option>' + pipes + '</select>') +
     field('Environment', '<select id="r-env">' + envNames(item.environment || 'DEV') + '</select>') +
+    field('Version', '<input id="r-version" value="' + esc(item.version || '') + '" placeholder="build number or image tag">', 'full') +
     '</div>';
 }
 function artifactForm(art) {
@@ -486,13 +499,12 @@ function artifactForm(art) {
     '</div>';
 }
 function stageRows(stages) {
-  const list = stages && stages.length ? stages : ['Checkout', 'Build', 'Test', 'Package'];
-  return list.map((stage) => '<div class="stage-row"><input value="' + esc(stage) + '"><button type="button" data-act="remove-stage" aria-label="Remove stage">×</button></div>').join('');
+  return (stages || []).map((stage) => '<div class="stage-row"><input value="' + esc(stage) + '"><button type="button" data-act="remove-stage" aria-label="Remove stage">×</button></div>').join('');
 }
 function pipelineForm(existing) {
   const item = existing || {};
   const defaults = S.defaults || {};
-  const stages = (item.stages && item.stages.length ? item.stages : ['Checkout', 'Build', 'Test', 'Package']);
+  const stages = existing ? [] : ['Checkout', 'Build', 'Test', 'Package'];
   const mode = existing ? '' : '<div class="field full"><span>How to add it</span><label class="check"><input type="radio" name="p-mode" value="create" checked> Create the definition in Concierto and publish it to the engine</label><label class="check"><input type="radio" name="p-mode" value="link"> Link a pipeline that already exists</label></div>';
   return '<div class="pipe-form"><div>' + mode +
     '<input id="p-id" type="hidden" value="' + esc(item.id || '') + '">' +
@@ -502,12 +514,15 @@ function pipelineForm(existing) {
     field('Engine', '<select id="p-engine">' + optionList(['Jenkins', 'GitHub Actions', 'Azure DevOps'], item.engine || 'Jenkins') + '</select>') +
     field('Application', '<select id="p-app">' + appOptions(item.appId || '') + '</select>') +
     field('Branch', '<input id="p-branch" value="' + esc(item.branch || defaults.githubBranch || 'main') + '">') +
+    field('Deploys to', '<select id="p-env"><option value="">Do not update an environment</option>' + (S.environments || []).map((env) => '<option value="' + esc(env.id) + '" ' + (env.id === item.environmentId ? 'selected' : '') + '>' + esc(env.name) + '</option>').join('') + '</select>') +
     '</div>' +
+    '<label class="check" id="p-image-wrap" hidden><input id="p-image" type="checkbox" ' + (item.buildImage ? 'checked' : '') + '> Build and push <b id="p-image-name"></b></label>' +
     '<p class="hint" id="p-name-hint"></p>' +
     '<div class="engine-fields" data-engine="GitHub Actions">' + field('GitHub repository', '<input id="p-gh-repo" value="' + esc(item.engine === 'GitHub Actions' ? (item.repo || '') : ((defaults.githubRepos || [])[0] || '')) + '" placeholder="owner/name">') + '</div>' +
     '<div class="engine-fields" data-engine="Azure DevOps">' + field('Azure Repos repository', '<input id="p-az-repo" value="' + esc(item.engine === 'Azure DevOps' ? (item.repo || '') : (defaults.azureRepository || '')) + '">') +
     '<div class="mode-create">' + field('YAML path', '<input id="p-yaml" value="' + esc(item.engine === 'Azure DevOps' ? (item.workflow || '') : '') + '" placeholder="/concierto/pipeline.yml">') + '</div></div>' +
     '<div class="mode-link field"><span>Existing pipeline</span><select id="p-remote"><option value="">Choose after the list loads</option></select></div>' +
+    '<div id="param-box" class="mode-create field full"><span>Parameters</span><div id="param-editor"></div><button type="button" class="btn" data-act="add-param">Add parameter</button><p class="hint">Jenkins parameters for this job. Saving writes them into the pipeline script and into the Jenkins job.</p></div>' +
     '<div class="mode-create field full"><span id="unit-label">Stages</span><div id="stage-editor">' + stageRows(stages) + '</div><button type="button" class="btn" data-act="add-stage">Add</button><p class="hint" id="unit-hint">Saving keeps only these names in the definition and writes that file back to the engine.</p></div>' +
     '<label class="check"><input id="p-approval" type="checkbox" ' + (item.approvalRequired ? 'checked' : '') + '> Require approval in Concierto before the run starts</label>' +
     '<label class="check mode-create"><input id="p-push" type="checkbox" ' + (item.pushTrigger ? 'checked' : '') + '> Also run on push to the branch</label>' +
@@ -528,6 +543,9 @@ function readPipelineForm() {
     stages: [...document.querySelectorAll('#stage-editor input')].map((input) => input.value.trim()).filter(Boolean),
     approvalRequired: checked('p-approval'),
     pushTrigger: checked('p-push'),
+    environmentId: val('p-env'),
+    buildImage: checked('p-image'),
+    parameterDefs: document.getElementById('param-box') && !document.getElementById('param-box').hidden ? readParamRows() : undefined,
     publish: true,
     jenkinsJob: engine === 'Jenkins' ? name : '',
     githubRepo: val('p-gh-repo'),
@@ -545,6 +563,49 @@ function fillStages(names) {
   if (!editor || !names || !names.length) return;
   editor.innerHTML = stageRows(names);
 }
+function paramRow(param) {
+  const item = param || { name: '', type: 'string', defaultValue: '', description: '', choices: '' };
+  return '<div class="param-row">' +
+    '<input data-field="name" placeholder="Name" value="' + esc(item.name || '') + '">' +
+    '<select data-field="type">' + ['string', 'text', 'boolean', 'choice'].map((type) => '<option value="' + type + '" ' + (item.type === type ? 'selected' : '') + '>' + type + '</option>').join('') + '</select>' +
+    '<input data-field="default" placeholder="Default or choices" value="' + esc(item.type === 'choice' ? (item.choices || '') : (item.defaultValue ?? '')) + '">' +
+    '<input data-field="description" placeholder="Description" value="' + esc(item.description || '') + '">' +
+    '<button type="button" data-act="remove-param" aria-label="Remove parameter">×</button></div>';
+}
+function renderParams(params) {
+  const editor = document.getElementById('param-editor');
+  if (!editor) return;
+  const list = params || [];
+  editor.innerHTML = list.length ? list.map(paramRow).join('') : '<p class="hint">No parameters yet.</p>';
+}
+function readParamRows() {
+  return [...document.querySelectorAll('#param-editor .param-row')].map((row) => {
+    const value = (fieldName) => {
+      const input = row.querySelector('[data-field="' + fieldName + '"]');
+      return input ? input.value.trim() : '';
+    };
+    const type = value('type') || 'string';
+    const fallback = value('default');
+    return {
+      name: value('name'),
+      type,
+      defaultValue: type === 'choice' ? '' : fallback,
+      choices: type === 'choice' ? fallback : '',
+      description: value('description')
+    };
+  }).filter((item) => item.name);
+}
+function decodeXmlClient(text) {
+  return String(text || '').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, '&');
+}
+function syncImageOption() {
+  const app = (S.apps || []).find((item) => item.id === val('p-app'));
+  const wrap = document.getElementById('p-image-wrap');
+  const name = document.getElementById('p-image-name');
+  if (!wrap) return;
+  wrap.hidden = !(app && app.image);
+  if (name) name.textContent = app && app.image ? app.image : '';
+}
 function applyPipeFormVisibility() {
   const engine = val('p-engine') || 'Jenkins';
   const modeEl = document.querySelector('input[name="p-mode"]:checked');
@@ -560,6 +621,9 @@ function applyPipeFormVisibility() {
   if (unitHint) unitHint.textContent = engine === 'Jenkins'
     ? 'Name the Jenkins stages to keep. Saving removes the others from the job and writes the definition back.'
     : 'Name the steps to keep. Saving removes the others from the workflow file and writes it back.';
+  const params = document.getElementById('param-box');
+  if (params) params.hidden = engine !== 'Jenkins' || mode === 'link';
+  syncImageOption();
   const push = document.getElementById('p-push');
   if (push && checked('p-approval')) {
     push.checked = false;
@@ -617,7 +681,8 @@ async function loadDefinitionEditor(existing) {
     const active = files.active || existing.workflow || (files.files[0] && files.files[0].path) || '';
     renderFileTree(files.files || [], active);
     const units = definition.units && definition.units.length ? definition.units : [];
-    if (units.length && !(existing.stages && existing.stages.length)) fillStages(units);
+    if (units.length) fillStages(units);
+    renderParams(definition.parameters || []);
   } catch (err) {
     area.value = err.message;
     document.getElementById('p-loaded').value = 'false';
@@ -705,7 +770,7 @@ async function savePipeline(id) {
 }
 function localUnits(engine, text) {
   const names = [];
-  const source = String(text || '');
+  const source = engine === 'Jenkins' ? decodeXmlClient(text) : String(text || '');
   if (engine === 'Jenkins') {
     const re = /stage\s*\(\s*(['"])((?:\\.|(?!\1).)*)\1/g;
     let match;
@@ -848,6 +913,26 @@ document.addEventListener('click', async (event) => {
         input.type = input.type === 'password' ? 'text' : 'password';
         actEl.textContent = input.type === 'password' ? 'Show' : 'Hide';
         return;
+      }
+      if (act === 'add-param') {
+        const editor = document.getElementById('param-editor');
+        if (!editor) return;
+        const empty = editor.querySelector('p');
+        if (empty) empty.remove();
+        editor.insertAdjacentHTML('beforeend', paramRow(null));
+        return;
+      }
+      if (act === 'remove-param') {
+        const row = actEl.closest('.param-row');
+        if (row) row.remove();
+        return;
+      }
+      if (act === 'collect-art') {
+        actEl.disabled = true;
+        await api('/api/artifacts/collect', { method: 'POST', body: {} });
+        S = await api('/api/state');
+        toast('Artifacts collected');
+        return render();
       }
       if (act === 'add-stage') {
         const editor = document.getElementById('stage-editor');
@@ -1035,6 +1120,7 @@ function onField(event) {
     return;
   }
   if (!event.target.closest('#modal-body')) return;
+  if (event.target.id === 'p-app') syncImageOption();
   if (event.target.id === 'p-engine' || event.target.name === 'p-mode' || event.target.id === 'p-approval') {
     applyPipeFormVisibility();
     const mode = document.querySelector('input[name="p-mode"]:checked');
@@ -1115,7 +1201,7 @@ async function saveEnv(id) {
   showView('environments');
 }
 async function saveRelease(id) {
-  const body = { name: val('r-name'), appId: val('r-app'), environment: val('r-env') };
+  const body = { name: val('r-name'), appId: val('r-app'), pipelineId: val('r-pipe'), environment: val('r-env'), version: val('r-version') };
   if (!body.name) throw new Error('Release name is required.');
   if (id) await api('/api/releases/' + encodeURIComponent(id), { method: 'PUT', body });
   else await api('/api/releases', { method: 'POST', body });

@@ -136,8 +136,31 @@ function saveCreds() {
   engines.clearCaches();
 }
 
+function inferAction(text) {
+  const value = String(text || '');
+  if (/^Started|^Approved and started|^Failed to start|^Approval requested/.test(value)) return 'Run';
+  if (/^Stopped/.test(value)) return 'Abort';
+  if (/^Synced|^Tested/.test(value)) return 'Sync';
+  if (/^Created|^Linked|^Added/.test(value)) return 'Create';
+  if (/^Updated|^Moved/.test(value)) return 'Edit';
+  if (/^Deleted|^Removed/.test(value)) return 'Delete';
+  if (/credential/i.test(value)) return 'Credentials';
+  if (/incident/i.test(value)) return 'Incident';
+  if (/release/i.test(value)) return 'Release';
+  if (/artifact/i.test(value)) return 'Artifact';
+  if (/environment/i.test(value)) return 'Environment';
+  return 'Activity';
+}
+
 function audit(text) {
-  state.audit.unshift({ id: uid('aud'), time: Date.now(), text });
+  state.audit.unshift({
+    id: uid('aud'),
+    time: Date.now(),
+    user: USER_NAME,
+    host: HOST_NAME,
+    action: inferAction(text),
+    detail: text
+  });
 }
 
 function configured() {
@@ -252,10 +275,35 @@ function pipelineSpec(body, current) {
     workflow: String(body.workflowPath || (current && current.workflow) || '').trim(),
     azureRepo: String(body.azureRepo || (engine === 'Azure DevOps' ? (body.repo || (current && current.repo)) : '') || creds.azureDevOps.repository || '').trim(),
     yamlPath: String(body.yamlPath || (current && current.engine === 'Azure DevOps' ? current.workflow : '') || '').trim(),
+    environmentId: String(body.environmentId || (current && current.environmentId) || '').trim(),
+    buildImage: Boolean(body.buildImage),
+    parameterDefs: Array.isArray(body.parameterDefs) ? body.parameterDefs : null,
     remoteId: String(body.remoteId || '').trim(),
     externalId: current && current.externalId || '',
     mode: body.mode || 'create'
   };
+}
+
+function shapeDefinition(spec) {
+  const app = state.apps.find((item) => item.id === spec.appId);
+  let text = spec.definitionText || '';
+  if (spec.engine === 'Jenkins' && Array.isArray(spec.parameterDefs)) {
+    text = engines.writeJenkinsParameterBlock(text, spec.parameterDefs);
+  }
+  if (spec.buildImage && app && app.image) {
+    text = engines.ensureImagePublish(text, spec.engine, app.image, creds.jenkins.shell);
+  }
+  if (String(text).trim()) {
+    const fromFile = engines.listUnits(text, spec.engine);
+    let keep = (spec.stages || []).map((item) => String(item || '').trim()).filter(Boolean);
+    const defaults = ['Checkout', 'Build', 'Test', 'Package'];
+    const isDefault = keep.length === defaults.length && keep.every((name, index) => name === defaults[index]);
+    if ((!keep.length || isDefault) && fromFile.length) keep = fromFile;
+    const shaped = engines.keepSelected(text, spec.engine, keep);
+    text = shaped.text;
+    if (shaped.names.length) spec.stages = shaped.names;
+  }
+  spec.definitionText = text;
 }
 
 function credsBranch(engine) {
@@ -385,16 +433,38 @@ function openIncident(run) {
 }
 
 function addArtifact(run, pipeline) {
-  if (state.artifacts.some((item) => item.runId === run.id)) return;
+  const app = state.apps.find((item) => item.id === pipeline.appId);
+  const image = app && app.image ? String(app.image).trim() : '';
+  const version = run.label || run.externalRunId || 'build';
+  const name = image && pipeline.buildImage ? image + ':' + version : pipeline.name + ' ' + version;
+  const key = (image && pipeline.buildImage ? 'image:' : 'run:') + pipeline.id + ':' + (run.id || version);
+  if (state.artifacts.some((item) => item.key === key || item.runId === run.id)) return;
   state.artifacts.unshift({
     id: uid('art'),
-    name: pipeline.name + ' ' + (run.label || run.externalRunId || 'build'),
+    key,
+    name,
     appId: pipeline.appId || '',
-    registry: pipeline.engine,
+    pipelineId: pipeline.id,
+    pipelineName: pipeline.name,
+    kind: image && pipeline.buildImage ? 'Image' : 'Build',
+    location: run.webUrl || pipeline.webUrl || pipeline.engine,
+    build: version,
+    engine: pipeline.engine,
+    registry: image && pipeline.buildImage ? image : pipeline.engine,
     status: 'Available',
     runId: run.id,
     created: Date.now()
   });
+  if (pipeline.environmentId) {
+    const env = state.environments.find((item) => item.id === pipeline.environmentId);
+    if (env) {
+      env.version = version;
+      env.status = 'Healthy';
+      env.appId = pipeline.appId || env.appId;
+      env.pipelineName = pipeline.name;
+      env.updated = Date.now();
+    }
+  }
 }
 
 function applyRun(run, pipeline, next) {
@@ -642,14 +712,8 @@ async function handle(req, res, url, body) {
         remote = await engines.linkRemote(creds, spec);
         definitionSource = 'linked';
       } else if (spec.publish) {
-        const selected = Array.isArray(body.stages) ? body.stages : spec.stages;
-        const shaped = spec.definitionText.trim()
-          ? engines.keepSelected(spec.definitionText, spec.engine, selected)
-          : { text: '', names: spec.stages };
-        if (shaped.text) {
-          spec.definitionText = shaped.text;
-          if (shaped.names.length) spec.stages = shaped.names;
-        }
+        if (Array.isArray(body.stages)) spec.stages = body.stages;
+        shapeDefinition(spec);
         remote = await engines.publish(creds, spec, { overwrite: false });
       }
       const pipeline = {
@@ -666,6 +730,8 @@ async function handle(req, res, url, body) {
         stages: spec.stages,
         approvalRequired: spec.approvalRequired,
         pushTrigger: spec.pushTrigger,
+        environmentId: spec.environmentId || '',
+        buildImage: spec.buildImage,
         status: remote.status || 'Idle',
         lastResult: '',
         lastRunLabel: remote.lastRunLabel || '—',
@@ -688,9 +754,8 @@ async function handle(req, res, url, body) {
       let remote = {};
       const writeDefinition = spec.publish && body.definitionLoaded !== false && String(spec.definitionText || '').trim();
       if (writeDefinition) {
-        const shaped = engines.keepSelected(spec.definitionText, spec.engine, Array.isArray(body.stages) ? body.stages : spec.stages);
-        spec.definitionText = shaped.text;
-        if (shaped.names.length) spec.stages = shaped.names;
+        if (Array.isArray(body.stages)) spec.stages = body.stages;
+        shapeDefinition(spec);
       }
       if (spec.engine === 'Jenkins' && !engineChanged && existing.externalId && existing.externalId !== spec.name) {
         await engines.renameJenkins(creds.jenkins, existing.externalId, spec.name);
@@ -715,6 +780,8 @@ async function handle(req, res, url, body) {
       existing.stages = spec.stages;
       existing.approvalRequired = spec.approvalRequired;
       existing.pushTrigger = spec.pushTrigger;
+      existing.environmentId = spec.environmentId || '';
+      existing.buildImage = spec.buildImage;
       if (remote.externalId) existing.externalId = remote.externalId;
       if (remote.workflow) existing.workflow = remote.workflow;
       if (remote.repo) existing.repo = remote.repo;
@@ -789,6 +856,17 @@ async function handle(req, res, url, body) {
       try {
         const definition = await engines.fetchDefinition(creds, pipeline);
         definition.units = engines.listUnits(definition.text, pipeline.engine);
+        definition.parameters = engines.parseJenkinsParameters(definition.text);
+        if (!definition.parameters.length && pipeline.engine === 'Jenkins') {
+          const remoteParams = await engines.readParameters(creds, pipeline);
+          definition.parameters = remoteParams.map((item) => ({
+            name: item.name,
+            type: /bool/i.test(item.type) ? 'boolean' : /choice/i.test(item.type) ? 'choice' : /text/i.test(item.type) ? 'text' : 'string',
+            defaultValue: item.defaultValue == null ? '' : String(item.defaultValue),
+            description: item.description || '',
+            choices: (item.choices || []).join('\n')
+          }));
+        }
         return send(res, 200, definition);
       } catch (err) {
         const local = engines.buildDefinition(pipeline, creds.jenkins.shell || 'bat');
@@ -902,7 +980,16 @@ async function handle(req, res, url, body) {
     if (method === 'POST' && parts.length === 2) {
       const name = String(body.name || '').trim();
       if (!name) return send(res, 400, { error: 'Release name is required.' });
-      const release = { id: uid('rel'), name, appId: body.appId || '', environment: body.environment || 'DEV', status: 'Ready', created: Date.now() };
+      const release = {
+        id: uid('rel'),
+        name,
+        appId: body.appId || '',
+        pipelineId: body.pipelineId || '',
+        environment: body.environment || 'DEV',
+        version: String(body.version || '').trim() || '—',
+        status: 'Ready',
+        created: Date.now()
+      };
       state.releases.unshift(release);
       audit('Created release ' + name);
       saveState();
@@ -912,7 +999,9 @@ async function handle(req, res, url, body) {
       const release = findById(state.releases, decodeURIComponent(parts[2]));
       release.name = String(body.name || release.name).trim();
       release.appId = body.appId || '';
+      release.pipelineId = body.pipelineId || '';
       release.environment = body.environment || release.environment;
+      release.version = String(body.version || release.version || '').trim() || '—';
       audit('Updated release ' + release.name);
       saveState();
       return send(res, 200, release);
@@ -927,13 +1016,55 @@ async function handle(req, res, url, body) {
     if (parts.length === 4 && parts[3] === 'approve' && method === 'POST') {
       const release = findById(state.releases, decodeURIComponent(parts[2]));
       release.status = 'Approved';
-      audit('Approved release ' + release.name);
+      release.approvedBy = USER_NAME;
+      release.approvedAt = Date.now();
+      const env = state.environments.find((item) => item.name === release.environment && (!release.appId || !item.appId || item.appId === release.appId))
+        || state.environments.find((item) => item.name === release.environment);
+      if (env) {
+        env.version = release.version || env.version;
+        env.status = 'Released';
+        env.appId = release.appId || env.appId;
+        env.pipelineName = (state.pipelines.find((item) => item.id === release.pipelineId) || {}).name || env.pipelineName || '';
+        env.updated = Date.now();
+      }
+      audit('Approved release ' + release.name + ' to ' + release.environment + ' as ' + USER_NAME);
       saveState();
       return send(res, 200, release);
     }
   }
 
   if (parts[0] === 'api' && parts[1] === 'artifacts') {
+    if (method === 'POST' && parts.length === 3 && parts[2] === 'collect') {
+      const found = [];
+      for (const pipeline of state.pipelines) {
+        const items = await engines.publishedArtifacts(creds, pipeline);
+        found.push(...items.map((item) => ({ ...item, appId: pipeline.appId || '', pipelineId: pipeline.id })));
+      }
+      let added = 0;
+      for (const item of found) {
+        if (state.artifacts.some((art) => art.key === item.key)) continue;
+        state.artifacts.unshift({
+          id: uid('art'),
+          key: item.key,
+          name: item.name,
+          appId: item.appId,
+          pipelineId: item.pipelineId,
+          pipelineName: item.pipelineName,
+          kind: item.kind,
+          location: item.location,
+          build: item.build,
+          engine: item.engine,
+          registry: item.engine,
+          status: 'Available',
+          runId: '',
+          created: Date.now()
+        });
+        added += 1;
+      }
+      audit('Collected ' + added + ' artifact' + (added === 1 ? '' : 's') + ' from the engines');
+      saveState();
+      return send(res, 200, { added, artifacts: state.artifacts });
+    }
     if (method === 'POST' && parts.length === 2) {
       const name = String(body.name || '').trim();
       if (!name) return send(res, 400, { error: 'Artifact name is required.' });
