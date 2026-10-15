@@ -44,6 +44,9 @@ let linkToken = 0;
 let previewTimer = 0;
 let polling = false;
 const definitions = {};
+const buildCache = {};
+const logCache = {};
+let shaping = false;
 
 function esc(value) {
   return String(value ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
@@ -325,7 +328,7 @@ function applications() {
 }
 function pipelines() {
   const data = pageOf(S.pipelines || [], (pipe) => [pipe.name, pipe.engine, pipe.repo, pipe.workflow, pipe.status, pipe.lastRunLabel].join(' '));
-  const rows = data.rows.map((pipe) => '<tr><td><b><button type="button" class="linkish" data-act="open-pipe" data-id="' + esc(pipe.id) + '">' + esc(pipe.name) + '</button></b><div class="hint">' + esc(sourceLabel(pipe.definitionSource)) + (pipe.missing ? ' · missing on engine' : '') + '</div></td><td>' + esc(pipe.engine) + '</td><td>' + esc(appName(pipe.appId)) + '</td><td>' + esc(pipe.repo || pipe.workflow || '—') + '</td><td>' + esc(pipe.lastRunLabel || '—') + '<div class="hint">' + formatTime(pipe.lastRunAt) + '</div></td><td>' + pill(pipe.missing ? 'Missing' : pipe.status) + '</td><td class="actions-cell"><button type="button" class="btn btn-primary small" data-act="run-pipe" data-id="' + esc(pipe.id) + '">Run</button><button type="button" class="btn btn-ghost small" data-act="edit-pipe" data-id="' + esc(pipe.id) + '">Edit</button><button type="button" class="btn btn-ghost small" data-act="open-url" data-id="' + esc(pipe.id) + '">Open</button><button type="button" class="btn btn-danger small" data-act="delete-pipe" data-id="' + esc(pipe.id) + '">Delete</button></td></tr>').join('');
+  const rows = data.rows.map((pipe) => '<tr><td><b><button type="button" class="linkish" data-act="open-pipe" data-id="' + esc(pipe.id) + '">' + esc(pipe.name) + '</button></b><div class="hint">' + esc(sourceLabel(pipe.definitionSource)) + (pipe.missing ? ' · missing on engine' : '') + '</div></td><td>' + esc(pipe.engine) + '</td><td>' + esc(appName(pipe.appId)) + '</td><td>' + esc(pipe.repo || pipe.workflow || '—') + '</td><td>' + esc(pipe.lastRunLabel || '—') + '<div class="hint">' + formatTime(pipe.lastRunAt) + '</div></td><td>' + pill(pipe.missing ? 'Missing' : pipe.status) + '</td><td class="actions-cell"><button type="button" class="btn btn-primary small" data-act="run-pipe" data-id="' + esc(pipe.id) + '">Run</button><button type="button" class="btn btn-ghost small" data-act="edit-pipe" data-id="' + esc(pipe.id) + '">Edit</button><button type="button" class="btn btn-ghost small" data-act="open-pipe" data-id="' + esc(pipe.id) + '">Builds</button><button type="button" class="btn btn-danger small" data-act="delete-pipe" data-id="' + esc(pipe.id) + '">Delete</button></td></tr>').join('');
   return pendingBanner() + bannerHtml() + toolbarHtml('One list for Jenkins jobs, GitHub workflows, and Azure Pipelines.', '<button type="button" class="btn" data-act="refresh">Refresh status</button><button type="button" class="btn" data-act="sync" data-provider="all">Sync from tools</button><button type="button" class="btn btn-primary" data-act="add-pipe">Create pipeline</button>') +
     table(['Pipeline', 'Engine', 'Application', 'Repository / job', 'Last run', 'Status', ''], rows, 7, 'No pipelines yet. Sync from a tool, or create one in Concierto.') + pager(data.total);
 }
@@ -413,12 +416,23 @@ function pipelineDetail(id) {
   if (!pipeline) return '<div class="card">This pipeline is no longer in Concierto. <button type="button" class="btn" data-view="pipelines">Back to pipelines</button></div>';
   const runs = (S.runs || []).filter((run) => run.pipelineId === id);
   const definition = definitions[id];
-  const stages = (pipeline.stages && pipeline.stages.length ? pipeline.stages : ['Source', 'Build', 'Test', 'Package']);
-  const runRows = runs.slice(0, 8).map((run) => '<tr><td>' + esc(run.label || '—') + '</td><td>' + pill(run.status) + '</td><td>' + formatTime(run.started) + '</td><td>' + (run.webUrl ? '<a href="' + esc(run.webUrl) + '" target="_blank" rel="noopener">Open</a>' : '—') + '</td><td>' + (run.status === 'Pending approval' ? '<button type="button" class="btn btn-primary small" data-act="approve-run" data-id="' + esc(run.id) + '">Approve and run</button>' : '') + '</td></tr>').join('');
-  const latest = runs[0];
+  const stages = pipeline.stages && pipeline.stages.length ? pipeline.stages : (definition && definition.units) || [];
+  const unit = pipeline.engine === 'Jenkins' ? 'Stages' : 'Steps';
+  const builds = buildCache[id] || [];
+  const selected = logCache[id] || {};
+  const buildRows = builds.map((build) => {
+    const stop = build.status === 'Running' || build.status === 'Queued'
+      ? '<button type="button" class="btn btn-danger small" data-act="abort-build" data-id="' + esc(id) + '" data-build="' + esc(build.id) + '">Abort</button>'
+      : '';
+    return '<tr><td><button type="button" class="linkish" data-act="show-log" data-id="' + esc(id) + '" data-build="' + esc(build.id) + '">' + esc(build.label) + '</button></td><td>' + pill(build.status) + '</td><td>' + formatTime(build.started) + '</td><td><button type="button" class="btn btn-ghost small" data-act="show-log" data-id="' + esc(id) + '" data-build="' + esc(build.id) + '">Log</button> ' + stop + '</td></tr>';
+  }).join('');
+  const pending = runs.filter((run) => run.status === 'Pending approval').map((run) => '<div class="pending-row"><span>Waiting for approval before ' + esc(pipeline.engine) + ' starts.</span><button type="button" class="btn btn-primary small" data-act="approve-run" data-id="' + esc(run.id) + '">Approve and run</button></div>').join('');
   return '<div class="detail-top"><div><button type="button" class="btn btn-ghost small" data-view="pipelines">Back</button><p class="hint">' + esc(pipeline.engine) + ' · ' + esc(sourceLabel(pipeline.definitionSource)) + (pipeline.repo ? ' · ' + esc(pipeline.repo) : '') + '</p></div><div class="actions"><button type="button" class="btn btn-primary" data-act="run-pipe" data-id="' + esc(pipeline.id) + '">Run</button><button type="button" class="btn" data-act="edit-pipe" data-id="' + esc(pipeline.id) + '">Edit</button><button type="button" class="btn" data-act="open-url" data-id="' + esc(pipeline.id) + '">Open in engine</button></div></div>' +
-    '<div class="card"><div class="flow">' + stages.map((stage, index) => '<span class="stage">' + esc(stage) + '</span>' + (index < stages.length - 1 ? '<span class="arrow">→</span>' : '')).join('') + '</div>' + (pipeline.approvalRequired ? '<p class="hint">Approval is required in Concierto before this pipeline can start. Push triggers are left off so a direct push cannot skip the gate.</p>' : '') + '</div>' +
-    '<div class="split"><div class="card"><h3>Definition</h3><p class="hint">' + esc(definition ? definition.source : 'Loading the definition…') + '</p><pre>' + esc(definition ? definition.text : '') + '</pre></div><div class="card"><h3>Runs</h3>' + table(['Run', 'Status', 'Started', '', ''], runRows, 5, 'No Concierto runs yet.') + (latest && latest.consoleTail ? '<h3 style="margin-top:14px">Latest log</h3><pre>' + esc(latest.consoleTail) + '</pre>' : '') + (latest && latest.error ? '<p class="hint">' + esc(latest.error) + '</p>' : '') + '</div></div>';
+    (stages.length ? '<div class="card"><div class="flow">' + stages.map((stage, index) => '<span class="stage">' + esc(stage) + '</span>' + (index < stages.length - 1 ? '<span class="arrow">→</span>' : '')).join('') + '</div></div>' : '') +
+    pending +
+    '<div class="split"><div class="card"><h3>Builds</h3><p class="hint">Builds and logs from ' + esc(pipeline.engine) + ', shown here.</p>' + table(['Build', 'Status', 'Started', ''], buildRows, 4, 'No builds yet.') +
+    '<h3 style="margin-top:14px">Log' + (selected.label ? ' ' + esc(selected.label) : '') + '</h3><pre class="log-view">' + esc(selected.text || 'Select a build to read its log.') + '</pre></div>' +
+    '<div class="card"><h3>Definition</h3><p class="hint">' + esc(definition ? definition.source : 'Loading the definition…') + (stages.length ? ' · ' + unit + ': ' + stages.map(esc).join(', ') : '') + '</p><pre>' + esc(definition ? definition.text : '') + '</pre></div></div>';
 }
 
 function openModal(title, body, save, label, wide) {
@@ -471,53 +485,65 @@ function artifactForm(art) {
     field('Location', '<input id="art-reg" value="' + esc(item.registry || '') + '">') +
     '</div>';
 }
+function stageRows(stages) {
+  const list = stages && stages.length ? stages : ['Checkout', 'Build', 'Test', 'Package'];
+  return list.map((stage) => '<div class="stage-row"><input value="' + esc(stage) + '"><button type="button" data-act="remove-stage" aria-label="Remove stage">×</button></div>').join('');
+}
 function pipelineForm(existing) {
   const item = existing || {};
   const defaults = S.defaults || {};
   const stages = (item.stages && item.stages.length ? item.stages : ['Checkout', 'Build', 'Test', 'Package']);
-  const publishChecked = existing ? item.definitionSource === 'concierto' : true;
   const mode = existing ? '' : '<div class="field full"><span>How to add it</span><label class="check"><input type="radio" name="p-mode" value="create" checked> Create the definition in Concierto and publish it to the engine</label><label class="check"><input type="radio" name="p-mode" value="link"> Link a pipeline that already exists</label></div>';
   return '<div class="pipe-form"><div>' + mode +
+    '<input id="p-id" type="hidden" value="' + esc(item.id || '') + '">' +
+    '<input id="p-loaded" type="hidden" value="false">' +
     '<div class="form-grid">' +
     field('Pipeline name', '<input id="p-name" value="' + esc(item.name || '') + '">') +
     field('Engine', '<select id="p-engine">' + optionList(['Jenkins', 'GitHub Actions', 'Azure DevOps'], item.engine || 'Jenkins') + '</select>') +
     field('Application', '<select id="p-app">' + appOptions(item.appId || '') + '</select>') +
-    field('Or create an application', '<input id="p-new-app" placeholder="New application name">') +
     field('Branch', '<input id="p-branch" value="' + esc(item.branch || defaults.githubBranch || 'main') + '">') +
-    '<div class="mode-create">' + field('Template', '<select id="p-template"><option value="html-page" ' + (item.template !== 'generic' ? 'selected' : '') + '>HTML page</option><option value="generic" ' + (item.template === 'generic' ? 'selected' : '') + '>Generic stages</option></select>') + '</div>' +
     '</div>' +
-    '<div class="engine-fields" data-engine="Jenkins"><div class="mode-create">' + field('Jenkins job name', '<input id="p-job" value="' + esc(item.engine === 'Jenkins' ? (item.externalId || '') : '') + '" placeholder="html-page">') + '</div></div>' +
-    '<div class="engine-fields" data-engine="GitHub Actions">' + field('GitHub repository', '<input id="p-gh-repo" value="' + esc(item.engine === 'GitHub Actions' ? (item.repo || '') : ((defaults.githubRepos || [])[0] || '')) + '" placeholder="owner/name">') + '<div class="mode-create">' + field('Workflow file', '<input id="p-workflow" value="' + esc(item.engine === 'GitHub Actions' ? (item.workflow || '') : '') + '" placeholder=".github/workflows/html-page.yml">') + '</div></div>' +
-    '<div class="engine-fields" data-engine="Azure DevOps">' + field('Azure Repos repository', '<input id="p-az-repo" value="' + esc(item.engine === 'Azure DevOps' ? (item.repo || '') : (defaults.azureRepository || '')) + '">') + '<div class="mode-create">' + field('YAML path', '<input id="p-yaml" value="' + esc(item.engine === 'Azure DevOps' ? (item.workflow || '') : '') + '" placeholder="/concierto/html-page.yml">') + '</div></div>' +
+    '<p class="hint" id="p-name-hint"></p>' +
+    '<div class="engine-fields" data-engine="GitHub Actions">' + field('GitHub repository', '<input id="p-gh-repo" value="' + esc(item.engine === 'GitHub Actions' ? (item.repo || '') : ((defaults.githubRepos || [])[0] || '')) + '" placeholder="owner/name">') + '</div>' +
+    '<div class="engine-fields" data-engine="Azure DevOps">' + field('Azure Repos repository', '<input id="p-az-repo" value="' + esc(item.engine === 'Azure DevOps' ? (item.repo || '') : (defaults.azureRepository || '')) + '">') +
+    '<div class="mode-create">' + field('YAML path', '<input id="p-yaml" value="' + esc(item.engine === 'Azure DevOps' ? (item.workflow || '') : '') + '" placeholder="/concierto/pipeline.yml">') + '</div></div>' +
     '<div class="mode-link field"><span>Existing pipeline</span><select id="p-remote"><option value="">Choose after the list loads</option></select></div>' +
-    '<div class="mode-create field full"><span>Stages</span><div id="stage-editor">' + stages.map((stage) => '<div class="stage-row"><input value="' + esc(stage) + '"><button type="button" data-act="remove-stage" aria-label="Remove stage">×</button></div>').join('') + '</div><button type="button" class="btn" data-act="add-stage">Add stage</button></div>' +
+    '<div class="mode-create field full"><span id="unit-label">Stages</span><div id="stage-editor">' + stageRows(stages) + '</div><button type="button" class="btn" data-act="add-stage">Add</button><p class="hint" id="unit-hint">Saving keeps only these names in the definition and writes that file back to the engine.</p></div>' +
     '<label class="check"><input id="p-approval" type="checkbox" ' + (item.approvalRequired ? 'checked' : '') + '> Require approval in Concierto before the run starts</label>' +
     '<label class="check mode-create"><input id="p-push" type="checkbox" ' + (item.pushTrigger ? 'checked' : '') + '> Also run on push to the branch</label>' +
-    '<label class="check mode-create"><input id="p-publish" type="checkbox" ' + (publishChecked ? 'checked' : '') + '> ' + (existing ? 'Replace the definition on the engine with the stages above' : 'Publish the definition to the engine') + '</label>' +
-    (existing ? '<p class="hint">Changing the engine creates the definition on the new engine and leaves the previous one in place.</p>' : '<p class="hint">Save credentials before publishing. Windows Jenkins uses bat. The HTML template writes dist/index.html on the agent.</p>') +
-    '</div><div><div class="field"><span>Definition preview</span><pre id="p-preview">Generating…</pre></div></div></div>';
+    '</div><div class="mode-create"><div class="field"><span>Definition</span><div id="p-files" class="file-tree" hidden></div><textarea id="p-def" spellcheck="false" placeholder="The pipeline file appears here."></textarea><p class="hint">This is the file on Jenkins, GitHub Actions, or Azure DevOps. Saving writes this text back to that tool.</p></div></div></div>';
 }
 function readPipelineForm() {
   const modeEl = document.querySelector('input[name="p-mode"]:checked');
+  const engine = val('p-engine') || 'Jenkins';
+  const name = val('p-name');
+  const definitionPath = val('p-file') || val('p-yaml');
   return {
     mode: modeEl ? modeEl.value : 'edit',
-    name: val('p-name'),
+    name,
     appId: val('p-app'),
-    newAppName: val('p-new-app'),
-    engine: val('p-engine') || 'Jenkins',
-    template: val('p-template') || 'html-page',
+    engine,
+    template: 'generic',
     branch: val('p-branch') || 'main',
     stages: [...document.querySelectorAll('#stage-editor input')].map((input) => input.value.trim()).filter(Boolean),
     approvalRequired: checked('p-approval'),
     pushTrigger: checked('p-push'),
-    publish: checked('p-publish'),
-    jenkinsJob: val('p-job'),
+    publish: true,
+    jenkinsJob: engine === 'Jenkins' ? name : '',
     githubRepo: val('p-gh-repo'),
-    workflowPath: val('p-workflow'),
+    workflowPath: definitionPath,
     azureRepo: val('p-az-repo'),
-    yamlPath: val('p-yaml'),
-    remoteId: val('p-remote')
+    yamlPath: val('p-yaml') || definitionPath,
+    remoteId: val('p-remote'),
+    definitionText: document.getElementById('p-def') ? document.getElementById('p-def').value : '',
+    definitionPath,
+    definitionLoaded: val('p-loaded') === 'true'
   };
+}
+function fillStages(names) {
+  const editor = document.getElementById('stage-editor');
+  if (!editor || !names || !names.length) return;
+  editor.innerHTML = stageRows(names);
 }
 function applyPipeFormVisibility() {
   const engine = val('p-engine') || 'Jenkins';
@@ -526,6 +552,14 @@ function applyPipeFormVisibility() {
   document.querySelectorAll('.engine-fields').forEach((el) => { el.hidden = el.dataset.engine !== engine; });
   document.querySelectorAll('.mode-create').forEach((el) => { el.hidden = mode === 'link'; });
   document.querySelectorAll('.mode-link').forEach((el) => { el.hidden = mode !== 'link'; });
+  const label = document.getElementById('unit-label');
+  const hint = document.getElementById('p-name-hint');
+  const unitHint = document.getElementById('unit-hint');
+  if (label) label.textContent = engine === 'Jenkins' ? 'Stages' : 'Steps';
+  if (hint) hint.textContent = engine === 'Jenkins' ? 'The pipeline name is the Jenkins job name.' : '';
+  if (unitHint) unitHint.textContent = engine === 'Jenkins'
+    ? 'Name the Jenkins stages to keep. Saving removes the others from the job and writes the definition back.'
+    : 'Name the steps to keep. Saving removes the others from the workflow file and writes it back.';
   const push = document.getElementById('p-push');
   if (push && checked('p-approval')) {
     push.checked = false;
@@ -533,21 +567,75 @@ function applyPipeFormVisibility() {
   } else if (push) push.disabled = false;
 }
 async function refreshPreview() {
-  const pre = document.getElementById('p-preview');
-  if (!pre) return;
+  const slot = document.getElementById('p-def');
+  if (!slot || slot.dataset.remote === '1' || slot.dataset.touched === '1') return;
   const modeEl = document.querySelector('input[name="p-mode"]:checked');
-  if (modeEl && modeEl.value === 'link') {
-    pre.textContent = 'Linking keeps the definition that already exists on the engine.';
-    return;
-  }
+  if (modeEl && modeEl.value === 'link') return;
   try {
     const data = await api('/api/preview', { method: 'POST', body: readPipelineForm() });
-    const slot = document.getElementById('p-preview');
-    if (slot) slot.textContent = data.filename + '\n\n' + data.text;
+    const area = document.getElementById('p-def');
+    if (area && area.dataset.remote !== '1' && area.dataset.touched !== '1') {
+      area.value = data.text;
+      document.getElementById('p-loaded').value = 'true';
+    }
   } catch (err) {
-    const slot = document.getElementById('p-preview');
-    if (slot) slot.textContent = err.message;
+    const area = document.getElementById('p-def');
+    if (area && area.dataset.touched !== '1') area.value = err.message;
   }
+}
+function renderFileTree(files, active) {
+  const host = document.getElementById('p-files');
+  if (!host) return;
+  if (!files || !files.length || (val('p-engine') || 'Jenkins') !== 'GitHub Actions') {
+    host.hidden = true;
+    host.innerHTML = '';
+    return;
+  }
+  const groups = {};
+  for (const file of files) {
+    const folder = file.folder ? '.github/workflows/' + file.folder : '.github/workflows';
+    if (!groups[folder]) groups[folder] = [];
+    groups[folder].push(file);
+  }
+  host.hidden = false;
+  host.innerHTML = Object.keys(groups).map((folder) => '<div class="tree-folder">' + esc(folder) + '</div>' + groups[folder].map((file) => '<button type="button" data-act="pick-file" data-path="' + esc(file.path) + '" class="' + (file.path === active ? 'active' : '') + '">' + esc(file.name) + '</button>').join('')).join('') +
+    '<input id="p-file" type="hidden" value="' + esc(active || '') + '">';
+}
+async function loadDefinitionEditor(existing) {
+  const area = document.getElementById('p-def');
+  if (!area) return;
+  if (!existing) return refreshPreview();
+  try {
+    const [definition, files] = await Promise.all([
+      api('/api/pipelines/' + encodeURIComponent(existing.id) + '/definition'),
+      api('/api/pipelines/' + encodeURIComponent(existing.id) + '/files')
+    ]);
+    if (!document.getElementById('p-def')) return;
+    area.value = definition.text || '';
+    area.dataset.remote = definition.failed ? '' : '1';
+    document.getElementById('p-loaded').value = definition.failed ? 'false' : 'true';
+    const active = files.active || existing.workflow || (files.files[0] && files.files[0].path) || '';
+    renderFileTree(files.files || [], active);
+    const units = definition.units && definition.units.length ? definition.units : [];
+    if (units.length && !(existing.stages && existing.stages.length)) fillStages(units);
+  } catch (err) {
+    area.value = err.message;
+    document.getElementById('p-loaded').value = 'false';
+  }
+}
+async function loadFileIntoEditor(path) {
+  const id = val('p-id');
+  if (!id || !path) return;
+  const area = document.getElementById('p-def');
+  const file = await api('/api/pipelines/' + encodeURIComponent(id) + '/file?path=' + encodeURIComponent(path));
+  if (!document.getElementById('p-def')) return;
+  area.value = file.text || '';
+  area.dataset.remote = '1';
+  document.getElementById('p-loaded').value = 'true';
+  const hidden = document.getElementById('p-file');
+  if (hidden) hidden.value = path;
+  document.querySelectorAll('#p-files button').forEach((button) => button.classList.toggle('active', button.dataset.path === path));
+  if (file.units && file.units.length) fillStages(file.units);
 }
 function schedulePreview() {
   clearTimeout(previewTimer);
@@ -615,9 +703,44 @@ async function savePipeline(id) {
   showView('pipelines');
   toast(data.warning || (id ? 'Pipeline updated' : 'Pipeline saved'));
 }
-async function runPipeline(id) {
+function localUnits(engine, text) {
+  const names = [];
+  const source = String(text || '');
+  if (engine === 'Jenkins') {
+    const re = /stage\s*\(\s*(['"])((?:\\.|(?!\1).)*)\1/g;
+    let match;
+    while ((match = re.exec(source))) names.push(match[2]);
+    return names;
+  }
+  const re = engine === 'Azure DevOps'
+    ? /displayName:\s*['"]?(.+?)['"]?\s*$/gm
+    : /^\s*-\s*name:\s*['"]?(.+?)['"]?\s*$/gm;
+  let match;
+  while ((match = re.exec(source))) names.push(match[1].trim());
+  return names;
+}
+async function shapeOpenDefinition() {
+  const area = document.getElementById('p-def');
+  if (!area || !area.value.trim()) return;
+  const stages = [...document.querySelectorAll('#stage-editor input')].map((input) => input.value.trim()).filter(Boolean);
+  shaping = true;
   try {
-    const data = await api('/api/pipelines/' + encodeURIComponent(id) + '/run', { method: 'POST', body: {} });
+    const data = await api('/api/definition/shape', { method: 'POST', body: { engine: val('p-engine') || 'Jenkins', text: area.value, stages } });
+    if (document.getElementById('p-def')) {
+      area.value = data.text;
+      area.dataset.remote = '1';
+      const loaded = document.getElementById('p-loaded');
+      if (loaded) loaded.value = 'true';
+    }
+  } catch (err) {
+    toastError(err);
+  } finally {
+    shaping = false;
+  }
+}
+async function startRun(id, parameters) {
+  try {
+    const data = await api('/api/pipelines/' + encodeURIComponent(id) + '/run', { method: 'POST', body: { parameters: parameters || {} } });
     S = await api('/api/state');
     toast(data.run && data.run.status === 'Pending approval' ? 'Waiting for approval. The engine has not started.' : 'Run requested.');
     render();
@@ -627,11 +750,51 @@ async function runPipeline(id) {
     render();
   }
 }
+function paramControl(param) {
+  const type = String(param.type || '');
+  if (type.includes('File')) return '<div class="field"><span>' + esc(param.name) + '</span><p class="hint">File parameters have to be set in Jenkins. This form cannot upload a file.</p></div>';
+  const described = param.description ? '<p class="hint">' + esc(param.description) + '</p>' : '';
+  if (type.includes('Boolean')) {
+    const on = param.defaultValue === true || param.defaultValue === 'true';
+    return '<label class="check"><input data-param="' + esc(param.name) + '" type="checkbox" ' + (on ? 'checked' : '') + '> ' + esc(param.name) + '</label>' + described;
+  }
+  if (param.choices && param.choices.length) {
+    return field(param.name, '<select data-param="' + esc(param.name) + '">' + param.choices.map((choice) => '<option ' + (String(choice) === String(param.defaultValue) ? 'selected' : '') + '>' + esc(choice) + '</option>').join('') + '</select>') + described;
+  }
+  if (type.includes('Text')) return field(param.name, '<textarea data-param="' + esc(param.name) + '">' + esc(param.defaultValue ?? '') + '</textarea>') + described;
+  const inputType = type.includes('Password') ? 'password' : 'text';
+  return field(param.name, '<input data-param="' + esc(param.name) + '" type="' + inputType + '" value="' + esc(param.defaultValue ?? '') + '">') + described;
+}
+async function runPipeline(id) {
+  let info = { parameters: [] };
+  try {
+    info = await api('/api/pipelines/' + encodeURIComponent(id) + '/parameters');
+  } catch (err) {
+    toastError(err);
+    return;
+  }
+  const params = info.parameters || [];
+  if (!params.length) return startRun(id, {});
+  openModal('Run parameters', '<p class="hint">Jenkins will not start this job until these values are submitted.</p>' + params.map(paramControl).join(''), async () => {
+    const parameters = {};
+    document.querySelectorAll('#modal-body [data-param]').forEach((el) => {
+      parameters[el.getAttribute('data-param')] = el.type === 'checkbox' ? el.checked : el.value;
+    });
+    closeModal();
+    await startRun(id, parameters);
+  }, 'Run');
+}
 async function decoratePipeline(id) {
   try {
     definitions[id] = await api('/api/pipelines/' + encodeURIComponent(id) + '/definition');
   } catch (err) {
     definitions[id] = { text: err.message, source: 'Could not read the engine definition' };
+  }
+  try {
+    const listed = await api('/api/pipelines/' + encodeURIComponent(id) + '/builds');
+    buildCache[id] = listed.builds || [];
+  } catch (err) {
+    buildCache[id] = buildCache[id] || [];
   }
   const run = (S.runs || []).find((item) => item.pipelineId === id && item.status !== 'Pending approval');
   if (run) {
@@ -655,12 +818,14 @@ async function tick() {
   try {
     S = await api('/api/state?refresh=1');
     if (detailId) {
-      const run = (S.runs || []).find((item) => item.pipelineId === detailId && (item.status === 'Running' || item.status === 'Queued' || item.status === 'Success' || item.status === 'Failed'));
-      if (run) {
-        const logged = await api('/api/runs/' + encodeURIComponent(run.id) + '?log=1');
-        const index = S.runs.findIndex((item) => item.id === run.id);
-        if (index >= 0) S.runs[index] = logged.run;
-      }
+      try {
+        const listed = await api('/api/pipelines/' + encodeURIComponent(detailId) + '/builds');
+        buildCache[detailId] = listed.builds || [];
+        if (logCache[detailId] && logCache[detailId].id) {
+          const log = await api('/api/pipelines/' + encodeURIComponent(detailId) + '/builds/' + encodeURIComponent(logCache[detailId].id) + '/log');
+          logCache[detailId].text = log.text || '';
+        }
+      } catch (err) { /* keep the last build list */ }
     }
     if (currentView !== 'credentials') render();
   } catch (err) { /* leave the current screen up */ }
@@ -695,9 +860,25 @@ document.addEventListener('click', async (event) => {
       }
       if (act === 'remove-stage') {
         const rows = document.querySelectorAll('#stage-editor .stage-row');
-        if (rows.length < 2) return toast('Keep at least one stage.', 'err');
+        if (rows.length < 2) return toast('Keep at least one stage or step.', 'err');
         actEl.closest('.stage-row').remove();
-        return schedulePreview();
+        return shapeOpenDefinition();
+      }
+      if (act === 'pick-file') return loadFileIntoEditor(actEl.dataset.path);
+      if (act === 'show-log') {
+        const buildId = actEl.dataset.build;
+        const data = await api('/api/pipelines/' + encodeURIComponent(id) + '/builds/' + encodeURIComponent(buildId) + '/log');
+        const build = (buildCache[id] || []).find((item) => item.id === buildId);
+        logCache[id] = { id: buildId, label: build ? build.label : ('#' + buildId), text: data.text || '' };
+        if (currentView === 'pipeline/' + id) render();
+        return;
+      }
+      if (act === 'abort-build') {
+        await api('/api/pipelines/' + encodeURIComponent(id) + '/builds/' + encodeURIComponent(actEl.dataset.build) + '/stop', { method: 'POST', body: {} });
+        const listed = await api('/api/pipelines/' + encodeURIComponent(id) + '/builds');
+        buildCache[id] = listed.builds || [];
+        toast('Stop requested');
+        return render();
       }
       if (act === 'add-app') return openModal('Add application', appForm(null), () => saveApp(null), 'Add');
       if (act === 'edit-app') return openModal('Edit application', appForm((S.apps || []).find((item) => item.id === id)), () => saveApp(id), 'Save');
@@ -722,9 +903,10 @@ document.addEventListener('click', async (event) => {
         return schedulePreview();
       }
       if (act === 'edit-pipe') {
-        openModal('Edit pipeline', pipelineForm((S.pipelines || []).find((item) => item.id === id)), () => savePipeline(id), 'Save', true);
+        const pipeline = (S.pipelines || []).find((item) => item.id === id);
+        openModal('Edit pipeline', pipelineForm(pipeline), () => savePipeline(id), 'Save', true);
         applyPipeFormVisibility();
-        return schedulePreview();
+        return loadDefinitionEditor(pipeline);
       }
       if (act === 'delete-pipe') {
         const pipeline = (S.pipelines || []).find((item) => item.id === id);
@@ -862,7 +1044,23 @@ function onField(event) {
     const mode = document.querySelector('input[name="p-mode"]:checked');
     if (mode && mode.value === 'link') loadLinkOptions();
   }
-  if (document.getElementById('p-preview')) schedulePreview();
+  if (event.target.id === 'p-def') {
+    event.target.dataset.touched = '1';
+    event.target.dataset.remote = '1';
+    if (!shaping) {
+      const names = localUnits(val('p-engine') || 'Jenkins', event.target.value);
+      if (names.length) fillStages(names);
+    }
+    return;
+  }
+  if (event.target.id === 'p-engine' && !val('p-id')) {
+    const area = document.getElementById('p-def');
+    if (area) {
+      delete area.dataset.remote;
+      delete area.dataset.touched;
+    }
+    schedulePreview();
+  }
 }
 document.getElementById('modal-form').addEventListener('submit', async (event) => {
   event.preventDefault();

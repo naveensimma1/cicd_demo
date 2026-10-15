@@ -1,5 +1,6 @@
 'use strict';
 
+const zlib = require('zlib');
 const DEFAULT_STAGES = ['Checkout', 'Build', 'Test', 'Package'];
 const PAGE_HTML = '<!DOCTYPE html><html><body><h1>Built by Concierto CICD</h1></body></html>';
 const crumbCache = new Map();
@@ -487,6 +488,7 @@ async function githubWorkflowDrafts(cfg, repo) {
   const workflows = data.workflows || [];
   const drafts = [];
   for (const workflow of workflows) {
+    if (!keepGithubWorkflow(workflow)) continue;
     let status = workflow.state === 'disabled_manually' || workflow.state === 'disabled_inactivity' ? 'Idle' : 'Idle';
     let lastResult = '';
     let lastRunLabel = '—';
@@ -672,7 +674,8 @@ async function publishJenkins(cfg, pipeline, overwrite) {
   if (!/^[A-Za-z0-9][A-Za-z0-9 _.-]{0,80}$/.test(jobName) || jobName.includes('/') || jobName.includes('\\')) {
     fail(400, 'Jenkins job name can use letters, numbers, spaces, dots, underscores, and hyphens. Create folders in Jenkins itself.');
   }
-  const xml = jenkinsXml(jenkinsScript(pipeline, cfg.shell), 'Managed by Concierto CICD');
+  const script = String(pipeline.definitionText || '').trim() || jenkinsScript(pipeline, cfg.shell);
+  const xml = jenkinsXml(script, 'Managed by Concierto CICD');
   const exists = await jenkinsJobExists(cfg, jobName);
   if (exists && !overwrite) {
     fail(409, 'Jenkins already has a job named "' + jobName + '". Link that job, or choose another name.');
@@ -733,7 +736,7 @@ async function publishGithub(cfg, pipeline, overwrite, previous) {
   }
   const existing = await githubFile(cfg, repo, filePath, branch);
   if (existing && !overwrite) fail(409, 'That workflow file already exists. Link it, or choose another file name.');
-  const text = githubYaml({ ...pipeline, branch, pushTrigger: pipeline.pushTrigger && !pipeline.approvalRequired });
+  const text = String(pipeline.definitionText || '').trim() || githubYaml({ ...pipeline, branch, pushTrigger: pipeline.pushTrigger && !pipeline.approvalRequired });
   const body = {
     message: (existing ? 'Update' : 'Add') + ' pipeline from Concierto CICD',
     content: Buffer.from(text, 'utf8').toString('base64'),
@@ -805,7 +808,7 @@ async function publishAzure(cfg, pipeline, overwrite, previous) {
     if (err.status !== 404) throw err;
   }
   if (exists && !overwrite) fail(409, 'That YAML file already exists in ' + repo.name + '. Link the pipeline, or choose another path.');
-  const content = azureYaml({ ...pipeline, branch, pushTrigger: pipeline.pushTrigger && !pipeline.approvalRequired });
+  const content = String(pipeline.definitionText || '').trim() || azureYaml({ ...pipeline, branch, pushTrigger: pipeline.pushTrigger && !pipeline.approvalRequired });
   await azureSend(cfg, 'POST', projectPath(cfg, 'git/repositories/' + repo.id + '/pushes'), {
     refUpdates: [{ name: 'refs/heads/' + branch, oldObjectId }],
     commits: [{
@@ -913,9 +916,25 @@ async function linkRemote(creds, pipeline) {
   fail(400, 'Choose Jenkins, GitHub Actions, or Azure DevOps.');
 }
 
-async function triggerJenkins(cfg, pipeline) {
+async function triggerJenkins(cfg, pipeline, parameters) {
   if (!pipeline.externalId) fail(400, 'Publish or link this pipeline to a Jenkins job before running it.');
-  const sent = await jenkinsSend(cfg, 'POST', jobApiPath(pipeline.externalId) + '/build');
+  const defs = await jenkinsParameters(cfg, pipeline.externalId);
+  let sent;
+  if (defs.length) {
+    const form = new URLSearchParams();
+    for (const def of defs) {
+      let value = parameters && Object.prototype.hasOwnProperty.call(parameters, def.name) ? parameters[def.name] : def.defaultValue;
+      if (value === undefined || value === null) value = '';
+      if (typeof value === 'boolean') value = value ? 'true' : 'false';
+      form.append(def.name, String(value));
+    }
+    sent = await jenkinsSend(cfg, 'POST', jobApiPath(pipeline.externalId) + '/buildWithParameters', {
+      body: form.toString(),
+      contentType: 'application/x-www-form-urlencoded'
+    });
+  } else {
+    sent = await jenkinsSend(cfg, 'POST', jobApiPath(pipeline.externalId) + '/build');
+  }
   let queueUrl = sent.location || '';
   if (queueUrl && !/^https?:/i.test(queueUrl)) queueUrl = joinUrl(cfg.url, queueUrl);
   if (queueUrl && !queueUrl.endsWith('/')) queueUrl += '/';
@@ -929,7 +948,7 @@ async function triggerJenkins(cfg, pipeline) {
   };
 }
 
-async function triggerGithub(cfg, pipeline) {
+async function triggerGithub(cfg, pipeline, parameters) {
   const repo = pipeline.repo;
   const { owner, name } = splitRepo(repo);
   let workflowId = pipeline.externalId;
@@ -939,7 +958,9 @@ async function triggerGithub(cfg, pipeline) {
   }
   if (!workflowId) fail(400, 'GitHub has not listed this workflow yet. Wait a minute and run it again.');
   const branch = pipeline.branch || cfg.branch || 'main';
-  await githubRaw(cfg.token, 'POST', '/repos/' + encodeURIComponent(owner) + '/' + encodeURIComponent(name) + '/actions/workflows/' + encodeURIComponent(workflowId) + '/dispatches', { ref: branch });
+  const dispatch = { ref: branch };
+  if (parameters && Object.keys(parameters).length) dispatch.inputs = parameters;
+  await githubRaw(cfg.token, 'POST', '/repos/' + encodeURIComponent(owner) + '/' + encodeURIComponent(name) + '/actions/workflows/' + encodeURIComponent(workflowId) + '/dispatches', dispatch);
   return {
     status: 'Queued',
     externalRunId: '',
@@ -951,12 +972,12 @@ async function triggerGithub(cfg, pipeline) {
   };
 }
 
-async function triggerAzure(cfg, pipeline) {
+async function triggerAzure(cfg, pipeline, parameters) {
   if (!pipeline.externalId) fail(400, 'Publish or link this pipeline to Azure DevOps before running it.');
   const branch = pipeline.branch || cfg.branch || 'main';
-  const { data } = await azureSend(cfg, 'POST', projectPath(cfg, 'pipelines/' + encodeURIComponent(pipeline.externalId) + '/runs'), {
-    resources: { repositories: { self: { refName: 'refs/heads/' + branch } } }
-  });
+  const payload = { resources: { repositories: { self: { refName: 'refs/heads/' + branch } } } };
+  if (parameters && Object.keys(parameters).length) payload.templateParameters = parameters;
+  const { data } = await azureSend(cfg, 'POST', projectPath(cfg, 'pipelines/' + encodeURIComponent(pipeline.externalId) + '/runs'), payload);
   return {
     status: mapAzure(data),
     externalRunId: String(data.id || ''),
@@ -967,10 +988,10 @@ async function triggerAzure(cfg, pipeline) {
   };
 }
 
-async function trigger(creds, pipeline) {
-  if (pipeline.engine === 'Jenkins') return triggerJenkins(creds.jenkins, pipeline);
-  if (pipeline.engine === 'GitHub Actions') return triggerGithub(creds.github, pipeline);
-  if (pipeline.engine === 'Azure DevOps') return triggerAzure(creds.azureDevOps, pipeline);
+async function trigger(creds, pipeline, parameters) {
+  if (pipeline.engine === 'Jenkins') return triggerJenkins(creds.jenkins, pipeline, parameters);
+  if (pipeline.engine === 'GitHub Actions') return triggerGithub(creds.github, pipeline, parameters);
+  if (pipeline.engine === 'Azure DevOps') return triggerAzure(creds.azureDevOps, pipeline, parameters);
   fail(400, 'This engine cannot be triggered from the prototype.');
 }
 
@@ -1155,6 +1176,540 @@ async function deleteRemote(creds, pipeline) {
   fail(400, 'Nothing to delete on the engine.');
 }
 
+function keepGithubWorkflow(workflow) {
+  const path = String(workflow.path || '').replace(/\\/g, '/');
+  const name = String(workflow.name || '');
+  if (/pages-build-deployment/i.test(path) || /pages-build-deployment/i.test(name)) return false;
+  if (path.startsWith('dynamic/')) return false;
+  if (path && !path.startsWith('.github/workflows/')) return false;
+  return true;
+}
+
+function asList(value) {
+  if (!value) return [];
+  return Array.isArray(value) ? value : [value];
+}
+
+function collectJenkinsParameters(data) {
+  const defs = [];
+  const props = asList(data && data.property).concat(asList(data && data.actions));
+  for (const prop of props) {
+    for (const def of asList(prop && prop.parameterDefinitions)) {
+      if (!def || !def.name || defs.some((item) => item.name === def.name)) continue;
+      defs.push({
+        name: def.name,
+        type: String(def.type || '').split('.').pop(),
+        description: def.description || '',
+        defaultValue: def.defaultParameterValue ? def.defaultParameterValue.value : '',
+        choices: asList(def.choices).map((item) => String(item))
+      });
+    }
+  }
+  return defs;
+}
+
+async function jenkinsParameters(cfg, jobName) {
+  const queried = await jenkinsSend(cfg, 'GET', jobApiPath(jobName) + '/api/json?tree=' + encodeURIComponent('property[parameterDefinitions[name,type,description,defaultParameterValue[value],choices]],actions[parameterDefinitions[name,type,description,defaultParameterValue[value],choices]]'));
+  const defs = collectJenkinsParameters(queried.data);
+  if (defs.length) return defs;
+  const full = await jenkinsSend(cfg, 'GET', jobApiPath(jobName) + '/api/json');
+  return collectJenkinsParameters(full.data);
+}
+
+function githubDispatchInputs(text) {
+  const lines = String(text || '').split(/\r?\n/);
+  const inputs = [];
+  let inDispatch = false;
+  let inInputs = false;
+  let inputsIndent = 0;
+  let current = null;
+  for (const line of lines) {
+    if (/^\s*workflow_dispatch:\s*$/.test(line)) { inDispatch = true; inInputs = false; current = null; continue; }
+    if (inDispatch && !inInputs && /^\S/.test(line)) { inDispatch = false; continue; }
+    if (inDispatch && /^\s*inputs:\s*$/.test(line)) {
+      inInputs = true;
+      inputsIndent = line.match(/^\s*/)[0].length;
+      continue;
+    }
+    if (!inInputs) continue;
+    if (!line.trim()) continue;
+    const indent = line.match(/^\s*/)[0].length;
+    if (indent <= inputsIndent) break;
+    const key = line.match(/^(\s*)([A-Za-z0-9_-]+):\s*(.*)$/);
+    if (key && key[1].length === inputsIndent + 2) {
+      current = { name: key[2], type: 'string', description: '', defaultValue: unquote(key[3]), choices: [] };
+      inputs.push(current);
+      continue;
+    }
+    if (!current) continue;
+    const desc = line.match(/description:\s*(.*)$/);
+    const def = line.match(/\bdefault:\s*(.*)$/);
+    const type = line.match(/\btype:\s*(.*)$/);
+    if (desc) current.description = unquote(desc[1]);
+    if (def) current.defaultValue = unquote(def[1]);
+    if (type) current.type = unquote(type[1]);
+  }
+  return inputs;
+}
+
+function azureYamlParameters(text) {
+  const lines = String(text || '').split(/\r?\n/);
+  const params = [];
+  let inParams = false;
+  let current = null;
+  for (const line of lines) {
+    if (/^parameters:\s*$/.test(line)) { inParams = true; current = null; continue; }
+    if (!inParams) continue;
+    if (/^\S/.test(line)) break;
+    const named = line.match(/^\s*-\s*name:\s*(.*)$/);
+    if (named) {
+      current = { name: unquote(named[1]), type: 'string', description: '', defaultValue: '', choices: [] };
+      params.push(current);
+      continue;
+    }
+    if (!current) continue;
+    const display = line.match(/displayName:\s*(.*)$/);
+    const type = line.match(/\btype:\s*(.*)$/);
+    const def = line.match(/\bdefault:\s*(.*)$/);
+    if (display) current.description = unquote(display[1]);
+    if (type) current.type = unquote(type[1]);
+    if (def) current.defaultValue = unquote(def[1]);
+  }
+  return params;
+}
+
+function unquote(value) {
+  return String(value || '').trim().replace(/^['"]|['"]$/g, '');
+}
+
+async function readParameters(creds, pipeline) {
+  if (pipeline.engine === 'Jenkins') {
+    if (!pipeline.externalId) return [];
+    return jenkinsParameters(creds.jenkins, pipeline.externalId);
+  }
+  if (pipeline.engine === 'GitHub Actions' || pipeline.engine === 'Azure DevOps') {
+    try {
+      const definition = await fetchDefinition(creds, pipeline);
+      if (pipeline.engine === 'GitHub Actions') return githubDispatchInputs(definition.text);
+      return azureYamlParameters(definition.text);
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+
+async function renameJenkins(cfg, fromName, toName) {
+  if (!fromName || fromName === toName) return;
+  if (String(fromName).includes('/') || String(fromName).includes('\\')) {
+    fail(400, 'This job is inside a Jenkins folder. Rename it in Jenkins, then sync again.');
+  }
+  if (!/^[A-Za-z0-9][A-Za-z0-9 _.-]{0,80}$/.test(toName)) {
+    fail(400, 'Jenkins job name can use letters, numbers, spaces, dots, underscores, and hyphens.');
+  }
+  await jenkinsSend(cfg, 'POST', jobApiPath(fromName) + '/doRename?newName=' + encodeURIComponent(toName));
+}
+
+async function saveJenkinsScript(cfg, jobName, script) {
+  const { text } = await jenkinsSend(cfg, 'GET', jobApiPath(jobName) + '/config.xml');
+  if (!/<script[\s>]/.test(text)) {
+    fail(400, 'This Jenkins job is not a Pipeline job, so its script cannot be edited from Concierto.');
+  }
+  const safe = String(script || '').replace(/]]>/g, ']]]]><![CDATA[>');
+  const xml = text.replace(/<script>[\s\S]*?<\/script>/, '<script><![CDATA[' + safe + ']]></script>');
+  await jenkinsSend(cfg, 'POST', jobApiPath(jobName) + '/config.xml', { body: xml, contentType: 'application/xml; charset=utf-8' });
+  const base = cfg.url.replace(/\/+$/, '');
+  return { externalId: jobName, workflow: jobName, webUrl: base + '/' + jobApiPath(jobName) + '/' };
+}
+
+async function writeGithubFile(cfg, repo, filePath, branch, text) {
+  const path = String(filePath || '').replace(/^\/+/, '');
+  if (!path.startsWith('.github/workflows/') || path.includes('..')) {
+    fail(400, 'Only files under .github/workflows can be saved from Concierto.');
+  }
+  const existing = await githubFile(cfg, repo, path, branch);
+  const body = {
+    message: (existing ? 'Update ' : 'Add ') + path + ' from Concierto CICD',
+    content: Buffer.from(String(text || ''), 'utf8').toString('base64'),
+    branch: branch || 'main'
+  };
+  if (existing && existing.sha) body.sha = existing.sha;
+  const { owner, name } = splitRepo(repo);
+  await githubRaw(cfg.token, 'PUT', '/repos/' + encodeURIComponent(owner) + '/' + encodeURIComponent(name) + '/contents/' + encodeURI(path), body);
+  let externalId = '';
+  if (/\.ya?ml$/i.test(path)) {
+    const { data } = await githubRaw(cfg.token, 'GET', '/repos/' + encodeURIComponent(owner) + '/' + encodeURIComponent(name) + '/actions/workflows?per_page=100');
+    const hit = (data.workflows || []).find((item) => item.path === path);
+    if (hit) externalId = String(hit.id);
+  }
+  return {
+    workflow: path,
+    repo: normalizeRepo(repo),
+    branch: branch || 'main',
+    externalId,
+    webUrl: 'https://github.com/' + normalizeRepo(repo) + '/blob/' + encodeURIComponent(branch || 'main') + '/' + path.split('/').map(encodeURIComponent).join('/')
+  };
+}
+
+async function writeAzureFile(cfg, repositoryName, yamlPath, branch, text) {
+  const repo = await findAzureRepo(cfg, repositoryName);
+  const target = branch || repo.defaultBranch || cfg.branch || 'main';
+  let path = String(yamlPath || '');
+  if (!path.startsWith('/')) path = '/' + path;
+  if (path.includes('..') || !/^\/[A-Za-z0-9._/-]+\.ya?ml$/.test(path)) {
+    fail(400, 'Azure YAML path must look like /concierto/name.yml.');
+  }
+  const refs = await azureSend(cfg, 'GET', projectPath(cfg, 'git/repositories/' + repo.id + '/refs?filter=' + encodeURIComponent('heads/' + target)));
+  const ref = (refs.data.value || []).find((item) => item.name === 'refs/heads/' + target);
+  const oldObjectId = ref ? ref.objectId : '0000000000000000000000000000000000000000';
+  let exists = false;
+  try {
+    await azureSend(cfg, 'GET', projectPath(cfg, 'git/repositories/' + repo.id + '/items?path=' + encodeURIComponent(path) + '&versionDescriptor.version=' + encodeURIComponent(target) + '&versionDescriptor.versionType=branch'));
+    exists = true;
+  } catch (err) {
+    if (err.status !== 404) throw err;
+  }
+  await azureSend(cfg, 'POST', projectPath(cfg, 'git/repositories/' + repo.id + '/pushes'), {
+    refUpdates: [{ name: 'refs/heads/' + target, oldObjectId }],
+    commits: [{
+      comment: (exists ? 'Update' : 'Add') + ' pipeline from Concierto CICD',
+      changes: [{ changeType: exists ? 'edit' : 'add', item: { path }, newContent: { content: String(text || ''), contentType: 'rawtext' } }]
+    }]
+  });
+  return { workflow: path, repo: repo.name, branch: target };
+}
+
+async function saveDefinition(creds, pipeline, text, filePath) {
+  if (pipeline.engine === 'Jenkins') {
+    const jobName = pipeline.externalId || pipeline.jenkinsJob || pipeline.name;
+    return saveJenkinsScript(creds.jenkins, jobName, text);
+  }
+  if (pipeline.engine === 'GitHub Actions') {
+    const repo = pipeline.repo || pipeline.githubRepo;
+    const branch = pipeline.branch || creds.github.branch || 'main';
+    const path = filePath || pipeline.workflow;
+    return writeGithubFile(creds.github, repo, path, branch, text);
+  }
+  if (pipeline.engine === 'Azure DevOps') {
+    const path = filePath || pipeline.workflow || pipeline.yamlPath;
+    return writeAzureFile(creds.azureDevOps, pipeline.repo || pipeline.azureRepo, path, pipeline.branch, text);
+  }
+  fail(400, 'Choose Jenkins, GitHub Actions, or Azure DevOps.');
+}
+
+async function listGithubDir(cfg, repo, dir, branch) {
+  const { owner, name } = splitRepo(repo);
+  try {
+    const { data } = await githubRaw(cfg.token, 'GET', '/repos/' + encodeURIComponent(owner) + '/' + encodeURIComponent(name) + '/contents/' + encodeURI(dir) + '?ref=' + encodeURIComponent(branch || 'main'));
+    return Array.isArray(data) ? data : [];
+  } catch (err) {
+    if (err.status === 404) return [];
+    throw err;
+  }
+}
+
+async function listWorkflowFiles(creds, pipeline) {
+  if (pipeline.engine === 'Jenkins') {
+    const name = pipeline.externalId || pipeline.name || 'Jenkinsfile';
+    return [{ path: name, name, folder: '' }];
+  }
+  if (pipeline.engine === 'Azure DevOps') {
+    const path = pipeline.workflow || pipeline.yamlPath || '';
+    if (!path) return [];
+    return [{ path, name: path.split('/').pop(), folder: path.split('/').slice(0, -1).join('/') }];
+  }
+  const repo = pipeline.repo || pipeline.githubRepo;
+  if (!repo) return [];
+  const branch = pipeline.branch || creds.github.branch || 'main';
+  const root = await listGithubDir(creds.github, repo, '.github/workflows', branch);
+  const files = [];
+  for (const item of root) {
+    if (item.type === 'dir') {
+      const children = await listGithubDir(creds.github, repo, item.path, branch);
+      for (const child of children) {
+        if (child.type === 'file') files.push({ path: child.path, name: child.name, folder: item.name });
+      }
+    } else if (item.type === 'file') {
+      files.push({ path: item.path, name: item.name, folder: '' });
+    }
+  }
+  return files;
+}
+
+async function readWorkflowFile(creds, pipeline, filePath) {
+  if (pipeline.engine === 'GitHub Actions') {
+    const repo = pipeline.repo || pipeline.githubRepo;
+    const branch = pipeline.branch || creds.github.branch || 'main';
+    const file = await githubFile(creds.github, repo, filePath, branch);
+    if (!file || !file.content) fail(404, 'That file is not on this branch.');
+    const text = Buffer.from(String(file.content).replace(/\n/g, ''), 'base64').toString('utf8');
+    return { path: filePath, text };
+  }
+  if (pipeline.engine === 'Azure DevOps') {
+    const definition = await fetchDefinition(creds, { ...pipeline, workflow: filePath });
+    return { path: filePath, text: definition.text };
+  }
+  const definition = await fetchDefinition(creds, pipeline);
+  return { path: pipeline.externalId || pipeline.name, text: definition.text };
+}
+
+function jenkinsStageSpans(text) {
+  const spans = [];
+  const re = /stage\s*\(\s*(['"])((?:\\.|(?!\1).)*)\1\s*\)/g;
+  let match;
+  while ((match = re.exec(text))) {
+    const braceAt = text.indexOf('{', match.index + match[0].length);
+    if (braceAt < 0) continue;
+    let depth = 0;
+    let end = braceAt;
+    for (; end < text.length; end++) {
+      if (text[end] === '{') depth += 1;
+      else if (text[end] === '}') {
+        depth -= 1;
+        if (depth === 0) { end += 1; break; }
+      }
+    }
+    spans.push({ name: match[2], start: match.index, end });
+    re.lastIndex = end;
+  }
+  return spans;
+}
+
+function filterJenkinsStages(text, keep) {
+  const spans = jenkinsStageSpans(text);
+  if (!spans.length) return { text, names: [] };
+  const names = spans.map((span) => span.name);
+  let next = '';
+  let cursor = 0;
+  for (const span of spans) {
+    next += text.slice(cursor, span.start);
+    if (keep.includes(span.name)) next += text.slice(span.start, span.end);
+    cursor = span.end;
+  }
+  next += text.slice(cursor);
+  const present = new Set(names);
+  const missing = keep.filter((name) => !present.has(name));
+  if (missing.length) {
+    const stubs = missing.map((name) => "    stage('" + name.replace(/'/g, "\\'") + "') {\n      steps {\n        echo '" + name.replace(/'/g, "\\'") + "'\n      }\n    }\n").join('');
+    const close = next.lastIndexOf('}');
+    next = close >= 0 ? next.slice(0, close) + '\n' + stubs + next.slice(close) : next + '\n' + stubs;
+  }
+  return { text: next, names: listUnits(next, 'Jenkins') };
+}
+
+function stepBlocks(lines, nameKey) {
+  const blocks = [];
+  let i = 0;
+  while (i < lines.length) {
+    const steps = lines[i].match(/^(\s*)steps:\s*$/);
+    if (!steps) { i += 1; continue; }
+    const stepsIndent = steps[1].length;
+    i += 1;
+    while (i < lines.length) {
+      const cur = lines[i];
+      if (!cur.trim()) { i += 1; continue; }
+      const indent = cur.match(/^\s*/)[0].length;
+      if (indent <= stepsIndent) break;
+      const step = cur.match(/^(\s*)-\s*(.*)$/);
+      if (!step || step[1].length <= stepsIndent) { i += 1; continue; }
+      const stepIndent = step[1].length;
+      const start = i;
+      const chunk = [cur];
+      i += 1;
+      while (i < lines.length) {
+        const nxt = lines[i];
+        if (!nxt.trim()) { chunk.push(nxt); i += 1; continue; }
+        if (nxt.match(/^\s*/)[0].length <= stepIndent) break;
+        chunk.push(nxt);
+        i += 1;
+      }
+      const nameLine = chunk.map((line) => line.match(new RegExp('\\b' + nameKey + ':\\s*[\\\'"]?(.+?)[\\\'"]?\\s*$'))).find(Boolean);
+      blocks.push({ start, end: i, name: nameLine ? unquote(nameLine[1]) : '', indent: stepIndent });
+    }
+  }
+  return blocks;
+}
+
+function filterNamedSteps(text, keep, nameKey, stub) {
+  const lines = String(text || '').split(/\r?\n/);
+  const blocks = stepBlocks(lines, nameKey);
+  const names = blocks.map((block) => block.name).filter(Boolean);
+  if (!blocks.length) return { text, names };
+  const drop = new Set(blocks.filter((block) => block.name && !keep.includes(block.name)).map((block) => block.start + ':' + block.end));
+  const out = [];
+  let cursor = 0;
+  for (const block of blocks) {
+    if (!drop.has(block.start + ':' + block.end)) continue;
+    out.push(...lines.slice(cursor, block.start));
+    cursor = block.end;
+  }
+  out.push(...lines.slice(cursor));
+  const present = new Set(names);
+  const missing = keep.filter((name) => !present.has(name));
+  if (missing.length) {
+    const stepsAt = out.findIndex((line) => /^(\s*)steps:\s*$/.test(line));
+    const indent = stepsAt >= 0 ? out[stepsAt].match(/^\s*/)[0] + '  ' : '      ';
+    const extra = missing.map((name) => stub(indent, name));
+    if (stepsAt >= 0) out.splice(stepsAt + 1, 0, ...extra);
+    else out.push(...extra);
+  }
+  return { text: out.join('\n'), names: listUnits(out.join('\n'), nameKey === 'displayName' ? 'Azure DevOps' : 'GitHub Actions') };
+}
+
+function listUnits(text, engine) {
+  if (engine === 'Jenkins') return jenkinsStageSpans(text).map((span) => span.name);
+  const key = engine === 'Azure DevOps' ? 'displayName' : 'name';
+  return stepBlocks(String(text || '').split(/\r?\n/), key).map((block) => block.name).filter(Boolean);
+}
+
+function keepSelected(text, engine, stages) {
+  const keep = (stages || []).map((item) => String(item || '').trim()).filter(Boolean);
+  const source = String(text || '');
+  if (!keep.length || !source.trim()) return { text: source, names: listUnits(source, engine) };
+  if (engine === 'Jenkins') return filterJenkinsStages(source, keep);
+  if (engine === 'Azure DevOps') {
+    return filterNamedSteps(source, keep, 'displayName', (indent, name) => indent + '- bash: echo \'' + name.replace(/'/g, '') + '\'\n' + indent + '  displayName: ' + name);
+  }
+  return filterNamedSteps(source, keep, 'name', (indent, name) => indent + '- name: ' + name + '\n' + indent + '  run: echo \'' + name.replace(/'/g, '') + '\'');
+}
+
+async function listBuilds(creds, pipeline) {
+  if (pipeline.engine === 'Jenkins') {
+    if (!pipeline.externalId) return [];
+    const { data } = await jenkinsSend(creds.jenkins, 'GET', jobApiPath(pipeline.externalId) + '/api/json?tree=' + encodeURIComponent('builds[number,result,timestamp,duration,url,building]{0,20}'));
+    return asList(data && data.builds).map((build) => ({
+      id: String(build.number),
+      label: '#' + build.number,
+      status: mapJenkinsBuild(build),
+      started: build.timestamp || null,
+      webUrl: build.url || ''
+    }));
+  }
+  if (pipeline.engine === 'GitHub Actions') {
+    const repo = pipeline.repo;
+    const { owner, name } = splitRepo(repo);
+    const workflowId = pipeline.externalId;
+    if (!workflowId) return [];
+    const { data } = await githubRaw(creds.github.token, 'GET', '/repos/' + encodeURIComponent(owner) + '/' + encodeURIComponent(name) + '/actions/workflows/' + encodeURIComponent(workflowId) + '/runs?per_page=15');
+    return (data.workflow_runs || []).map((run) => ({
+      id: String(run.id),
+      label: '#' + run.run_number,
+      status: mapGithub(run),
+      started: Date.parse(run.created_at) || null,
+      webUrl: run.html_url || ''
+    }));
+  }
+  if (pipeline.engine === 'Azure DevOps') {
+    if (!pipeline.externalId) return [];
+    const { data } = await azureSend(creds.azureDevOps, 'GET', projectPath(creds.azureDevOps, 'pipelines/' + encodeURIComponent(pipeline.externalId) + '/runs?$top=15'));
+    return (data.value || []).map((run) => ({
+      id: String(run.id),
+      label: run.name ? String(run.name) : ('#' + run.id),
+      status: mapAzure(run),
+      started: Date.parse(run.createdDate || '') || null,
+      webUrl: (run._links && run._links.web && run._links.web.href) || ''
+    }));
+  }
+  return [];
+}
+
+function unzipTexts(buffer) {
+  const parts = [];
+  let offset = 0;
+  while (offset + 30 <= buffer.length && buffer.readUInt32LE(offset) === 0x04034b50) {
+    const method = buffer.readUInt16LE(offset + 8);
+    const compSize = buffer.readUInt32LE(offset + 18);
+    const nameLen = buffer.readUInt16LE(offset + 26);
+    const extraLen = buffer.readUInt16LE(offset + 28);
+    const nameStart = offset + 30;
+    const name = buffer.slice(nameStart, nameStart + nameLen).toString('utf8');
+    const dataStart = nameStart + nameLen + extraLen;
+    const data = buffer.slice(dataStart, dataStart + compSize);
+    let text = '';
+    try {
+      if (method === 0) text = data.toString('utf8');
+      else if (method === 8) text = zlib.inflateRawSync(data).toString('utf8');
+    } catch { text = ''; }
+    if (text && !name.endsWith('/')) parts.push(name + '\n' + text.trim());
+    offset = dataStart + compSize;
+    if (parts.join('\n').length > 100000) break;
+  }
+  return parts.join('\n\n');
+}
+
+async function githubLog(token, owner, repo, runId) {
+  const url = 'https://api.github.com/repos/' + encodeURIComponent(owner) + '/' + encodeURIComponent(repo) + '/actions/runs/' + encodeURIComponent(runId) + '/logs';
+  const res = await fetch(url, {
+    headers: {
+      Authorization: 'Bearer ' + token,
+      Accept: 'application/vnd.github+json',
+      'User-Agent': 'Concierto-CICD',
+      'X-GitHub-Api-Version': '2022-11-28'
+    },
+    redirect: 'follow',
+    signal: AbortSignal.timeout(20000)
+  });
+  let unpacked = '';
+  if (res.ok) unpacked = unzipTexts(Buffer.from(await res.arrayBuffer()));
+  if (unpacked) return unpacked;
+  const jobs = await githubRaw(token, 'GET', '/repos/' + encodeURIComponent(owner) + '/' + encodeURIComponent(repo) + '/actions/runs/' + encodeURIComponent(runId) + '/jobs');
+  return jobStepLog(jobs.data);
+}
+
+function jobStepLog(data) {
+  const lines = [];
+  for (const job of (data && data.jobs) || []) {
+    lines.push(job.name + ' — ' + (job.conclusion || job.status));
+    for (const step of job.steps || []) lines.push('  ' + step.number + '. ' + step.name + ' — ' + (step.conclusion || step.status));
+  }
+  return lines.join('\n') || 'No log text yet.';
+}
+
+async function buildLog(creds, pipeline, buildId) {
+  if (pipeline.engine === 'Jenkins') {
+    const log = await jenkinsSend(creds.jenkins, 'GET', jobApiPath(pipeline.externalId) + '/' + encodeURIComponent(buildId) + '/consoleText');
+    return tail(log.text, 200);
+  }
+  if (pipeline.engine === 'GitHub Actions') {
+    const { owner, name } = splitRepo(pipeline.repo);
+    return tail(await githubLog(creds.github.token, owner, name, buildId), 200);
+  }
+  if (pipeline.engine === 'Azure DevOps') {
+    const timeline = await azureSend(creds.azureDevOps, 'GET', projectPath(creds.azureDevOps, 'build/builds/' + encodeURIComponent(buildId) + '/timeline'));
+    const lines = (timeline.data.records || [])
+      .filter((record) => ['Stage', 'Phase', 'Job', 'Task'].includes(record.type))
+      .map((record) => record.type + ': ' + record.name + ' — ' + (record.result || record.state || ''));
+    try {
+      const logs = await azureSend(creds.azureDevOps, 'GET', projectPath(creds.azureDevOps, 'build/builds/' + encodeURIComponent(buildId) + '/logs'));
+      const last = (logs.data.value || []).slice(-1)[0];
+      if (last && last.id) {
+        const body = await azureSend(creds.azureDevOps, 'GET', projectPath(creds.azureDevOps, 'build/builds/' + encodeURIComponent(buildId) + '/logs/' + last.id));
+        const text = typeof body.data === 'string' ? body.data : (body.data.value || body.data.message || JSON.stringify(body.data));
+        if (text) lines.push(String(text));
+      }
+    } catch { /* timeline is still useful */ }
+    return lines.join('\n');
+  }
+  return '';
+}
+
+async function abortBuild(creds, pipeline, buildId) {
+  if (pipeline.engine === 'Jenkins') {
+    await jenkinsSend(creds.jenkins, 'POST', jobApiPath(pipeline.externalId) + '/' + encodeURIComponent(buildId) + '/stop');
+    return { ok: true };
+  }
+  if (pipeline.engine === 'GitHub Actions') {
+    const { owner, name } = splitRepo(pipeline.repo);
+    await githubRaw(creds.github.token, 'POST', '/repos/' + encodeURIComponent(owner) + '/' + encodeURIComponent(name) + '/actions/runs/' + encodeURIComponent(buildId) + '/cancel');
+    return { ok: true };
+  }
+  if (pipeline.engine === 'Azure DevOps') {
+    await azureSend(creds.azureDevOps, 'PATCH', projectPath(creds.azureDevOps, 'build/builds/' + encodeURIComponent(buildId)), { status: 'cancelling' });
+    return { ok: true };
+  }
+  fail(400, 'This engine cannot be stopped from the prototype.');
+}
+
 module.exports = {
   DEFAULT_STAGES,
   cleanStages,
@@ -1178,5 +1733,16 @@ module.exports = {
   trigger,
   refreshRun,
   fetchDefinition,
-  deleteRemote
+  deleteRemote,
+  readParameters,
+  renameJenkins,
+  saveDefinition,
+  listWorkflowFiles,
+  readWorkflowFile,
+  listUnits,
+  keepSelected,
+  listBuilds,
+  buildLog,
+  abortBuild,
+  isPagesWorkflow: (name, path) => /pages-build-deployment/i.test(String(name || '') + ' ' + String(path || ''))
 };

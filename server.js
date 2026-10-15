@@ -239,11 +239,13 @@ function pipelineSpec(body, current) {
     engine,
     branch: String(body.branch || (current && current.branch) || credsBranch(engine)).trim() || 'main',
     stages,
-    template: body.template === 'generic' ? 'generic' : 'html-page',
+    template: 'generic',
     approvalRequired,
     pushTrigger: Boolean(body.pushTrigger) && !approvalRequired,
-    publish: body.publish !== false,
-    jenkinsJob: String(body.jenkinsJob || (current && current.engine === 'Jenkins' ? current.externalId : '') || engines.slug(name)).trim(),
+    publish: body.mode === 'link' ? false : body.publish !== false,
+    jenkinsJob: engine === 'Jenkins' ? name : String(body.jenkinsJob || '').trim(),
+    definitionText: String(body.definitionText || ''),
+    definitionPath: String(body.definitionPath || '').trim(),
     githubRepo: repo,
     repo: engine === 'GitHub Actions' ? repo : String(body.azureRepo || body.repo || (current && current.repo) || creds.azureDevOps.repository || '').trim(),
     workflowPath: String(body.workflowPath || (current && current.workflow) || '').trim(),
@@ -437,6 +439,7 @@ async function createRun(pipeline, remote) {
     status: remote.status || 'Queued',
     started: Date.now(),
     finished: null,
+    parameters: remote.parameters || null,
     externalRunId: remote.externalRunId || '',
     externalWorkflowId: remote.externalWorkflowId || pipeline.externalId || '',
     queueUrl: remote.queueUrl || '',
@@ -539,6 +542,10 @@ async function handle(req, res, url, body) {
     const file = engines.buildDefinition(spec, creds.jenkins.shell || 'bat');
     return send(res, 200, file);
   }
+  if (method === 'POST' && url.pathname === '/api/definition/shape') {
+    const engine = (body && body.engine) || 'Jenkins';
+    return send(res, 200, engines.keepSelected(body.text || '', engine, body.stages || []));
+  }
   if (method === 'POST' && url.pathname === '/api/sync') {
     const provider = (body && body.provider) || 'all';
     const results = [];
@@ -569,6 +576,7 @@ async function handle(req, res, url, body) {
         throw err;
       }
       const counts = applySync('GitHub Actions', collected.drafts, new Set(collected.syncedRepos.map((item) => item.toLowerCase())));
+      state.pipelines = state.pipelines.filter((item) => item.engine !== 'GitHub Actions' || !engines.isPagesWorkflow(item.name, item.workflow));
       const message = counts.imported + ' added, ' + counts.updated + ' updated.' + (collected.errors.length ? ' Skipped: ' + collected.errors.join(' | ') : '');
       audit('Synced GitHub Actions. ' + counts.imported + ' added, ' + counts.updated + ' updated.');
       return { ...counts, message };
@@ -634,6 +642,14 @@ async function handle(req, res, url, body) {
         remote = await engines.linkRemote(creds, spec);
         definitionSource = 'linked';
       } else if (spec.publish) {
+        const selected = Array.isArray(body.stages) ? body.stages : spec.stages;
+        const shaped = spec.definitionText.trim()
+          ? engines.keepSelected(spec.definitionText, spec.engine, selected)
+          : { text: '', names: spec.stages };
+        if (shaped.text) {
+          spec.definitionText = shaped.text;
+          if (shaped.names.length) spec.stages = shaped.names;
+        }
         remote = await engines.publish(creds, spec, { overwrite: false });
       }
       const pipeline = {
@@ -667,15 +683,28 @@ async function handle(req, res, url, body) {
     if (parts.length === 3 && method === 'PUT') {
       const existing = findById(state.pipelines, decodeURIComponent(parts[2]));
       const spec = pipelineSpec(body, existing);
-      spec.appId = attachNewApp(spec) || existing.appId;
+      spec.appId = body.appId || existing.appId;
       const engineChanged = existing.engine !== spec.engine;
       let remote = {};
-      if (spec.publish) {
-        const overwrite = Boolean(!engineChanged && existing.externalId);
-        remote = await engines.publish(creds, { ...spec, externalId: overwrite ? existing.externalId : spec.jenkinsJob }, {
-          overwrite,
-          previous: existing
-        });
+      const writeDefinition = spec.publish && body.definitionLoaded !== false && String(spec.definitionText || '').trim();
+      if (writeDefinition) {
+        const shaped = engines.keepSelected(spec.definitionText, spec.engine, Array.isArray(body.stages) ? body.stages : spec.stages);
+        spec.definitionText = shaped.text;
+        if (shaped.names.length) spec.stages = shaped.names;
+      }
+      if (spec.engine === 'Jenkins' && !engineChanged && existing.externalId && existing.externalId !== spec.name) {
+        await engines.renameJenkins(creds.jenkins, existing.externalId, spec.name);
+        existing.externalId = spec.name;
+      }
+      if (writeDefinition && !engineChanged && (existing.externalId || spec.engine !== 'Jenkins')) {
+        remote = await engines.saveDefinition(creds, {
+          ...existing,
+          ...spec,
+          externalId: spec.engine === 'Jenkins' ? spec.name : existing.externalId,
+          workflow: spec.definitionPath || existing.workflow
+        }, spec.definitionText, spec.definitionPath || existing.workflow);
+      } else if (spec.publish && engineChanged) {
+        remote = await engines.publish(creds, spec, { overwrite: false, previous: existing });
       }
       const previousEngine = existing.engine;
       existing.name = spec.name;
@@ -691,7 +720,8 @@ async function handle(req, res, url, body) {
       if (remote.repo) existing.repo = remote.repo;
       else existing.repo = spec.engine === 'GitHub Actions' ? spec.githubRepo : spec.azureRepo;
       if (remote.webUrl) existing.webUrl = remote.webUrl;
-      if (spec.publish) existing.definitionSource = 'concierto';
+      if (spec.engine === 'Jenkins') existing.externalId = spec.name;
+      if (writeDefinition || engineChanged) existing.definitionSource = 'concierto';
       existing.missing = false;
       audit(engineChanged
         ? 'Moved ' + existing.name + ' from ' + previousEngine + ' to ' + spec.engine + '. The previous engine definition was left in place.'
@@ -701,6 +731,7 @@ async function handle(req, res, url, body) {
     }
     if (parts.length === 4 && parts[3] === 'run' && method === 'POST') {
       const pipeline = findById(state.pipelines, decodeURIComponent(parts[2]));
+      const parameters = body && body.parameters && typeof body.parameters === 'object' ? body.parameters : {};
       if (pipeline.approvalRequired && !body.approved) {
         const run = {
           id: uid('run'),
@@ -710,6 +741,7 @@ async function handle(req, res, url, body) {
           status: 'Pending approval',
           started: Date.now(),
           finished: null,
+          parameters,
           externalRunId: '',
           queueUrl: '',
           webUrl: '',
@@ -727,7 +759,7 @@ async function handle(req, res, url, body) {
         return send(res, 202, { run });
       }
       try {
-        const remote = await engines.trigger(creds, pipeline);
+        const remote = await engines.trigger(creds, pipeline, parameters);
         const run = await createRun(pipeline, remote);
         return send(res, 201, { run });
       } catch (err) {
@@ -756,11 +788,45 @@ async function handle(req, res, url, body) {
       const pipeline = findById(state.pipelines, decodeURIComponent(parts[2]));
       try {
         const definition = await engines.fetchDefinition(creds, pipeline);
+        definition.units = engines.listUnits(definition.text, pipeline.engine);
         return send(res, 200, definition);
       } catch (err) {
         const local = engines.buildDefinition(pipeline, creds.jenkins.shell || 'bat');
-        return send(res, 200, { text: local.text, source: 'Generated locally. Engine read failed: ' + scrub(err.message) });
+        return send(res, 200, { text: local.text, source: 'Generated locally. Engine read failed: ' + scrub(err.message), units: engines.listUnits(local.text, pipeline.engine), failed: true });
       }
+    }
+    if (parts.length === 4 && parts[3] === 'parameters' && method === 'GET') {
+      const pipeline = findById(state.pipelines, decodeURIComponent(parts[2]));
+      const parameters = await engines.readParameters(creds, pipeline);
+      return send(res, 200, { parameters });
+    }
+    if (parts.length === 4 && parts[3] === 'builds' && method === 'GET') {
+      const pipeline = findById(state.pipelines, decodeURIComponent(parts[2]));
+      const builds = await engines.listBuilds(creds, pipeline);
+      return send(res, 200, { builds });
+    }
+    if (parts.length === 4 && parts[3] === 'files' && method === 'GET') {
+      const pipeline = findById(state.pipelines, decodeURIComponent(parts[2]));
+      const files = await engines.listWorkflowFiles(creds, pipeline);
+      return send(res, 200, { files, active: pipeline.workflow || '' });
+    }
+    if (parts.length === 4 && parts[3] === 'file' && method === 'GET') {
+      const pipeline = findById(state.pipelines, decodeURIComponent(parts[2]));
+      const file = await engines.readWorkflowFile(creds, pipeline, url.searchParams.get('path') || pipeline.workflow);
+      file.units = engines.listUnits(file.text, pipeline.engine);
+      return send(res, 200, file);
+    }
+    if (parts.length === 6 && parts[3] === 'builds' && parts[5] === 'log' && method === 'GET') {
+      const pipeline = findById(state.pipelines, decodeURIComponent(parts[2]));
+      const text = await engines.buildLog(creds, pipeline, decodeURIComponent(parts[4]));
+      return send(res, 200, { text });
+    }
+    if (parts.length === 6 && parts[3] === 'builds' && parts[5] === 'stop' && method === 'POST') {
+      const pipeline = findById(state.pipelines, decodeURIComponent(parts[2]));
+      await engines.abortBuild(creds, pipeline, decodeURIComponent(parts[4]));
+      audit('Stopped ' + pipeline.name + ' build ' + decodeURIComponent(parts[4]));
+      saveState();
+      return send(res, 200, { ok: true });
     }
   }
 
@@ -789,7 +855,7 @@ async function handle(req, res, url, body) {
     const pipeline = findById(state.pipelines, run.pipelineId);
     if (run.status !== 'Pending approval') return send(res, 400, { error: 'This run is not waiting for approval.' });
     try {
-      const remote = await engines.trigger(creds, pipeline);
+      const remote = await engines.trigger(creds, pipeline, run.parameters || {});
       applyRun(run, pipeline, { ...remote, started: Date.now(), error: '' });
       run.lookupAfter = remote.lookupAfter || Date.now();
       audit('Approved and started ' + pipeline.name);
